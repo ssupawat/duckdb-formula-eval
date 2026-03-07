@@ -14,6 +14,7 @@ import re
 import duckdb
 import pandas as pd
 import openpyxl
+import numexpr
 from typing import Any, Dict, List, Tuple, Optional
 from dataclasses import dataclass
 
@@ -167,7 +168,7 @@ class FormulaEvaluator:
 
     def _evaluate_scalar(self, formula: str, row_ctx: Dict[str, float]) -> float | str:
         """
-        Phase 2: Evaluate scalar expression using direct computation.
+        Phase 2: Evaluate scalar expression using numexpr for performance and security.
         Handles IF, arithmetic operations, VLOOKUP, and cell references.
 
         Returns either a numeric value or a string (for VLOOKUP results).
@@ -178,7 +179,17 @@ class FormulaEvaluator:
         # Substitute cell references with values from row_ctx
         for ref, value in row_ctx.items():
             # Match whole cell references like D1, not partial matches
-            expr = re.sub(rf'\b{re.escape(ref)}\b', str(value), expr)
+            # Quote string values to preserve them in the expression
+            if isinstance(value, str):
+                replacement = f'"{value}"'
+            else:
+                replacement = str(value)
+            expr = re.sub(rf'\b{re.escape(ref)}\b', replacement, expr)
+
+        # Convert Excel's = to Python's == for equality comparisons
+        # Pattern: value="value" or value=value -> value=="value" or value==value
+        # But avoid converting == that's already there, or in function calls
+        expr = re.sub(r'(?<=[\w"\'])=', '==', expr)
 
         # Handle VLOOKUP: VLOOKUP(lookup_value, table_array, col_index, range_lookup)
         # Check if formula is just a VLOOKUP (standalone, not part of larger expression)
@@ -191,12 +202,20 @@ class FormulaEvaluator:
             expr, vlookup_result = self._process_vlookup(expr)
 
         # Handle IF statements: IF(condition, true_value, false_value)
+        # This converts to Python ternary: (true_val if condition else false_val)
         expr = self._process_if_statements(expr)
 
-        # Evaluate the expression
+        # Convert Python ternary to numexpr where clause format
+        # Python: (true_val if condition else false_val)
+        # numexpr: where(condition, true_val, false_val)
+        expr = self._convert_to_numexpr(expr)
+
+        # Evaluate the expression using numexpr (faster and safer than eval)
         try:
-            # Use eval for simple arithmetic (safe in this controlled context)
-            result = eval(expr, {"__builtins__": {}}, {})
+            result = numexpr.evaluate(expr, local_dict={})
+            # numexpr returns a numpy array, extract scalar value
+            if hasattr(result, 'item'):
+                return float(result.item())
             return float(result)
         except Exception as e:
             raise ValueError(f"Failed to evaluate expression '{expr}': {e}")
@@ -297,6 +316,33 @@ class FormulaEvaluator:
 
         new_expr = re.sub(vlookup_pattern, replace_vlookup, expr)
         return (new_expr, vlookup_result)
+
+    def _convert_to_numexpr(self, expr: str) -> str:
+        """Convert Python ternary expression to numexpr format.
+
+        Python ternary: (true_val if condition else false_val)
+        numexpr format: where(condition, true_val, false_val)
+        """
+        # Pattern: (true_val if condition else false_val)
+        # Note: Python ternary puts condition in the middle
+        # We need to capture: (value_if_true if condition else value_if_false)
+        pattern = r'\(([^:]+?)\s+if\s+([^:]+?)\s+else\s+([^)]+?)\)'
+
+        def convert_match(m):
+            true_val = m.group(1).strip()
+            condition = m.group(2).strip()
+            false_val = m.group(3).strip()
+            return f'where({condition}, {true_val}, {false_val})'
+
+        # Process nested ternary (innermost first)
+        max_iterations = 5
+        for _ in range(max_iterations):
+            prev = expr
+            expr = re.sub(pattern, convert_match, expr)
+            if expr == prev:
+                break
+
+        return expr
 
 
 def create_test_excel():
