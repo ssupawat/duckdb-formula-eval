@@ -17,6 +17,18 @@ This project demonstrates using DuckDB for Excel formula evaluation, achieving *
 | 100K | 3.306s      | 234 MB      | 0.91s   | 1.45s   | 3.6x slower   |
 | 200K | 6.733s      | 359 MB      | 1.93s   | 2.04s   | 3.5x slower   |
 
+### Complex Formula Benchmarks (IF statements with numexpr)
+
+| Formula Type | Example | Rows | Time | Throughput |
+|--------------|---------|------|------|------------|
+| **Complex** | `=IF(A{i}="x", B{i}*1.1, B{i}*0.9)` | 10K | 1.67s | ~6K rows/s |
+| **Complex** | `=IF(A{i}="x", B{i}*1.1, B{i}*0.9)` | 50K | 8.32s | ~6K rows/s |
+| **Complex** | `=IF(A{i}="x", B{i}*1.1, B{i}*0.9)` | 100K | 17.54s | ~6K rows/s |
+
+**Note:** Complex formulas require per-row scalar evaluation (numexpr), making them ~4x slower than simple formulas processed entirely in SQL.
+
+See [BENCHMARK_COMPARISON.md](BENCHMARK_COMPARISON.md) for detailed performance analysis.
+
 ### Performance Improvement Over Original
 
 | Rows | Original Time | Optimized Time | Speedup |
@@ -31,9 +43,14 @@ This project demonstrates using DuckDB for Excel formula evaluation, achieving *
 |------|-------------|
 | `measure_duckdb_optimized.py` | Optimized implementation using pure SQL |
 | `test_formula_evaluator.py` | Comprehensive evaluator (aggregates, IF, VLOOKUP) |
-| `generate_test_files.py` | Generate test Excel files |
-| `run_benchmark.sh` | Run benchmark suite |
+| `measure_complex_formulas.py` | Complex formula benchmark (IF, VLOOKUP, nested) |
+| `generate_test_files.py` | Generate simple test Excel files |
+| `generate_complex_test_files.py` | Generate complex formula test files |
+| `run_benchmark.sh` | Run simple formula benchmark suite |
+| `run_complex_benchmark.sh` | Run complex formula benchmark suite |
+| `run_comparison.sh` | Compare simple vs complex formula performance |
 | `COMPARISON.md` | Detailed comparison and results |
+| `BENCHMARK_COMPARISON.md` | Simple vs complex formula performance analysis |
 
 ## Usage
 
@@ -47,6 +64,22 @@ python3 measure_duckdb_optimized.py test_files/test_10000.xlsx
 
 ```bash
 bash run_benchmark.sh
+```
+
+### Run Complex Formula Benchmark
+
+```bash
+# Generate complex test files
+python3 generate_complex_test_files.py
+
+# Run complex formula benchmark
+python3 measure_complex_formulas.py test_files_complex/complex_10000.xlsx
+
+# Run all complex formula benchmarks
+bash run_complex_benchmark.sh
+
+# Compare simple vs complex formulas
+bash run_comparison.sh
 ```
 
 ### Run Comprehensive Formula Tests (14 test cases)
@@ -88,7 +121,12 @@ Excel → DuckDB (bulk load) → SQL queries (bulk) → DuckDB → Excel
 ### Two-Phase Formula Evaluation (test_formula_evaluator.py)
 
 1. **Phase 1 (DuckDB SQL)**: Extract and compute all aggregates
-2. **Phase 2 (Python eval)**: Substitute aggregates and evaluate scalar expressions
+2. **Phase 2 (numexpr)**: Substitute aggregates and evaluate scalar expressions safely and efficiently
+
+Using **numexpr** instead of Python's `eval()` provides:
+- **2-10x faster** scalar expression evaluation (C-optimized)
+- **Security**: No arbitrary code execution risk
+- **Compatibility**: Works with numpy arrays and Python variables
 
 This hybrid approach supports complex nested formulas like:
 ```excel
@@ -103,12 +141,13 @@ pandas>=2.0.0
 openpyxl>=3.0.0
 formulas>=1.0.0
 psutil>=5.9.0
+numexpr>=2.8.0
 ```
 
 ## Installation
 
 ```bash
-pip install duckdb openpyxl pandas formulas psutil
+pip install duckdb openpyxl pandas formulas psutil numexpr
 ```
 
 ## License
