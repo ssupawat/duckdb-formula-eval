@@ -1,0 +1,34 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+dist/
+build/
+
+# Virtual environments
+venv/
+env/
+.venv/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Output files
+output_*.xlsx
+*.xlsx
+!test_files/*.xlsx
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Memory and snapshots
+.claudez/
+.claude/
