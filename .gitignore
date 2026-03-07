@@ -24,7 +24,6 @@ env/
 output_*.xlsx
 *.xlsx
 !test_files/*.xlsx
-!test_files_complex/*.xlsx
 
 # OS
 .DS_Store
