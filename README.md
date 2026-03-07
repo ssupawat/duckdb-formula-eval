@@ -150,6 +150,8 @@ numexpr>=2.8.0
 pip install duckdb openpyxl pandas formulas psutil numexpr
 ```
 
-## License
+Or using requirements.txt:
 
-MIT
+```bash
+pip install -r requirements.txt
+```
