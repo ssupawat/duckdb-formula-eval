@@ -147,7 +147,3 @@ duckdb-formula-demo/
     ├── simple_10k.xlsx         # Simple formula test file
     └── complex_10k.xlsx        # Complex formula test file
 ```
-
-## License
-
-MIT
