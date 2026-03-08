@@ -34,6 +34,102 @@ class FormulaEvaluator:
         self.conn = conn
         self.sheets_data = sheets_data
 
+    def _parse_formula_pattern(self, formula: str) -> Dict[str, Any]:
+        """
+        Parse a formula to detect patterns that can be vectorized.
+
+        Returns:
+            {
+                'type': 'simple' | 'scalar' | 'cross_sheet' | 'complex',
+                'pattern': e.g., 'A+B' or 'A*2' or 'Sheet1!A',
+                'columns': list of column letters involved,
+                'source_sheet': for cross_sheet patterns
+            }
+        """
+        # Remove leading = and whitespace
+        formula = formula.lstrip('=').strip()
+
+        # Simple arithmetic between two columns: A2+B2, A2*C2, etc.
+        simple_arithmetic = re.match(r'^([A-Z])\d+\s*([+\-*/])\s*([A-Z])\d+$', formula)
+        if simple_arithmetic:
+            return {
+                'type': 'simple',
+                'pattern': f'{simple_arithmetic.group(1)} {simple_arithmetic.group(2)} {simple_arithmetic.group(3)}',
+                'columns': [simple_arithmetic.group(1), simple_arithmetic.group(3)]
+            }
+
+        # Simple scalar operation on a column: A2*2, B2/10, etc.
+        simple_scalar = re.match(r'^([A-Z])\d+\s*([+\-*/])\s*(\d+(?:\.\d+)?)$', formula)
+        if simple_scalar:
+            return {
+                'type': 'scalar',
+                'pattern': f'{simple_scalar.group(1)} {simple_scalar.group(2)} {simple_scalar.group(3)}',
+                'columns': [simple_scalar.group(1)]
+            }
+
+        # Cross-sheet reference: Sheet1!A2
+        cross_sheet = re.match(r'^([A-Za-z0-9_]+)!([A-Z])\d+$', formula)
+        if cross_sheet:
+            return {
+                'type': 'cross_sheet',
+                'source_sheet': cross_sheet.group(1),
+                'column': cross_sheet.group(2)
+            }
+
+        # Complex formulas require the original two-phase approach
+        return {'type': 'complex'}
+
+    def _evaluate_vectorized(self, formula: str, sheet_name: str, pattern: Dict[str, Any]) -> pd.Series:
+        """
+        Evaluate simple formulas using vectorized SQL for entire columns.
+
+        Returns a pandas Series with the results for all rows.
+        """
+        table_name = sheet_name.lower().replace(' ', '_')
+        df = self.sheets_data.get(table_name)
+        if df is None:
+            raise ValueError(f"Sheet '{sheet_name}' not found")
+
+        # Build column mapping: Excel letter (A, B, C) to actual column name
+        col_map = {chr(ord('A') + i): df.columns[i] for i in range(len(df.columns))}
+
+        if pattern['type'] == 'simple':
+            # Two-column arithmetic: A+B, A-C, etc.
+            parts = pattern['pattern'].split()
+            col1 = col_map[parts[0]]
+            op = parts[1]
+            col2 = col_map[parts[2]]
+
+            sql_expr = f'"{col1}" {op} "{col2}"'
+            result_df = self.conn.execute(f'SELECT {sql_expr} FROM {table_name}').fetchdf()
+            return result_df.iloc[:, 0]
+
+        elif pattern['type'] == 'scalar':
+            # Column with scalar: A*2, B/10, etc.
+            parts = pattern['pattern'].split()
+            col = col_map[parts[0]]
+            op = parts[1]
+            scalar_val = parts[2]
+
+            sql_expr = f'"{col}" {op} {scalar_val}'
+            result_df = self.conn.execute(f'SELECT {sql_expr} FROM {table_name}').fetchdf()
+            return result_df.iloc[:, 0]
+
+        elif pattern['type'] == 'cross_sheet':
+            # Reference to another sheet: Sheet1!A
+            source_table = pattern['source_sheet'].lower().replace(' ', '_')
+            source_df = self.sheets_data.get(source_table)
+            if source_df is None:
+                raise ValueError(f"Source sheet '{pattern['source_sheet']}' not found")
+
+            source_col_map = {chr(ord('A') + i): source_df.columns[i] for i in range(len(source_df.columns))}
+            source_col = source_col_map[pattern['column']]
+
+            result_df = self.conn.execute(f'SELECT "{source_col}" FROM {source_table}').fetchdf()
+            return result_df.iloc[:, 0]
+
+        raise ValueError(f"Unsupported pattern type: {pattern['type']}")
+
     def evaluate_formula(self, formula: str, sheet_name: str, row_ctx: Dict[str, float] = None) -> Union[float, str]:
         """
         Evaluate a formula using two-phase approach:
