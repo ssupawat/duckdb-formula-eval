@@ -17,7 +17,7 @@ import re
 import duckdb
 import pandas as pd
 import numexpr
-from typing import Any, Dict, List, Tuple, Optional
+from typing import Any, Dict, List, Tuple, Optional, Union
 
 
 class FormulaEvaluator:
@@ -34,7 +34,7 @@ class FormulaEvaluator:
         self.conn = conn
         self.sheets_data = sheets_data
 
-    def evaluate_formula(self, formula: str, sheet_name: str, row_ctx: Dict[str, float] = None) -> float | str:
+    def evaluate_formula(self, formula: str, sheet_name: str, row_ctx: Dict[str, float] = None) -> Union[float, str]:
         """
         Evaluate a formula using two-phase approach:
         Phase 1: Extract and compute all aggregates using SQL
@@ -57,9 +57,9 @@ class FormulaEvaluator:
 
         # Patterns with their SQL equivalents (most specific first)
         patterns = [
-            # SUMIF/COUNTIF with criteria - handle both quote styles
-            (r'SUMIF\(([A-Z]+):([A-Z]+),[\'"]([^\'"]+)[\'"],([A-Z]+):([A-Z]+)\)', self._sumif),
-            (r'COUNTIF\(([A-Z]+):([A-Z]+),[\'"]([^\'"]+)[\'"]\)', self._countif),
+            # SUMIF/COUNTIF with criteria - handle both quote styles and unquoted criteria
+            (r'SUMIF\(([A-Z]+):([A-Z]+),\s*(?:\"([^\"]+)\"|\'([^\']+)\'|([^,)]+)),([A-Z]+):([A-Z]+)\)', self._sumif),
+            (r'COUNTIF\(([A-Z]+):([A-Z]+),\s*(?:\"([^\"]+)\"|\'([^\']+)\'|([^,)]+))\)', self._countif),
 
             # Basic aggregates
             (r'SUM\(([A-Z]+):([A-Z]+)\)', self._sum),
@@ -84,68 +84,130 @@ class FormulaEvaluator:
 
         return result
 
-    def _get_column_name(self, col_letter: str, sheet_name: str) -> str:
-        """Map Excel column letter to actual column name in the sheet."""
+    def _get_column_name(self, col_letter: str, sheet_name: str) -> Optional[str]:
+        """Map Excel column letter to actual column name in the sheet. Returns None if column doesn't exist."""
         df = self.sheets_data.get(sheet_name.lower().replace(' ', '_'))
         if df is None:
-            return f'col_{col_letter.lower()}'
+            return None
 
         # Column letter to index (A=0, B=1, etc.)
         col_idx = ord(col_letter.upper()) - ord('A')
         if col_idx < len(df.columns):
             return df.columns[col_idx]
-        return f'col_{col_letter.lower()}'
+        return None
 
     def _sum(self, m: re.Match, sheet_name: str) -> float:
         col = self._get_column_name(m.group(1), sheet_name)
+        if col is None:
+            return 0.0
         result = self.conn.execute(f"SELECT COALESCE(SUM(\"{col}\"), 0) FROM {sheet_name}").fetchone()[0]
         return float(result)
 
     def _average(self, m: re.Match, sheet_name: str) -> float:
         col = self._get_column_name(m.group(1), sheet_name)
+        if col is None:
+            return 0.0
         result = self.conn.execute(f"SELECT COALESCE(AVG(\"{col}\"), 0) FROM {sheet_name}").fetchone()[0]
         return float(result)
 
     def _max(self, m: re.Match, sheet_name: str) -> float:
         col = self._get_column_name(m.group(1), sheet_name)
+        if col is None:
+            return 0.0
         result = self.conn.execute(f"SELECT COALESCE(MAX(\"{col}\"), 0) FROM {sheet_name}").fetchone()[0]
         return float(result)
 
     def _min(self, m: re.Match, sheet_name: str) -> float:
         col = self._get_column_name(m.group(1), sheet_name)
+        if col is None:
+            return 0.0
         result = self.conn.execute(f"SELECT COALESCE(MIN(\"{col}\"), 0) FROM {sheet_name}").fetchone()[0]
         return float(result)
 
-    def _count(self, m: re.Match, sheet_name: str) -> int:
+    def _count(self, m: re.Match, sheet_name: str) -> float:
         col = self._get_column_name(m.group(1), sheet_name)
+        if col is None:
+            return 0.0
         result = self.conn.execute(f"SELECT COUNT(*) FROM {sheet_name} WHERE \"{col}\" IS NOT NULL").fetchone()[0]
-        return int(result)
+        return float(result)
 
     def _sumif(self, m: re.Match, sheet_name: str) -> float:
         criteria_col = self._get_column_name(m.group(1), sheet_name)
-        criteria_val = m.group(3)  # Already stripped by regex
-        sum_col = self._get_column_name(m.group(4), sheet_name)
+        if criteria_col is None:
+            return 0.0
+        # Extract criteria_val from the correct group (3, 4, or 5)
+        # Groups 3 and 4 are quoted (already stripped by regex), group 5 is unquoted
+        criteria_val_raw = (m.group(3) or m.group(4) or m.group(5) or "").strip()
+        sum_col = self._get_column_name(m.group(6), sheet_name)
+        if sum_col is None:
+            return 0.0
 
-        # Criteria is already extracted without quotes by regex
-        # Just use it directly with quotes for string comparison
+        # Handle empty criteria
+        if not criteria_val_raw or criteria_val_raw == '""':
+            # Empty criteria matches NULL/empty cells
+            where_clause = f'"{criteria_col}" IS NULL'
+        else:
+            # Parse criteria for operator and value
+            operator_match = re.match(r'([<>=!]+)\s*(.*)', criteria_val_raw)
+            if operator_match:
+                op = operator_match.group(1)
+                val_str = operator_match.group(2).strip()
+                # Convert operators
+                if op == '=':
+                    op = '=='
+                elif op == '<>':
+                    op = '!='
+
+                try:
+                    # Try to convert value to a number for comparison
+                    val = float(val_str)
+                    where_clause = f'"{criteria_col}" {op} {val}'
+                except ValueError:
+                    # If not a number, treat as string literal (e.g., "=Text")
+                    where_clause = f'"{criteria_col}" {op} \'{val_str}\''
+            else:
+                # No operator, assume exact match
+                where_clause = f'"{criteria_col}" = \'{criteria_val_raw}\''
+
         result = self.conn.execute(
-            f'SELECT COALESCE(SUM(\"{sum_col}\"), 0) FROM {sheet_name} WHERE \"{criteria_col}\" = \'{criteria_val}\''
+            f'SELECT COALESCE(SUM(\"{sum_col}\"), 0) FROM {sheet_name} WHERE {where_clause}'
         ).fetchone()[0]
 
         return float(result)
 
-    def _countif(self, m: re.Match, sheet_name: str) -> int:
+    def _countif(self, m: re.Match, sheet_name: str) -> float:
         col = self._get_column_name(m.group(1), sheet_name)
-        criteria_val = m.group(3)  # Already stripped by regex (group 3 for COUNTIF)
+        if col is None:
+            return 0.0
+        # Extract criteria_val from the correct group (3, 4, or 5)
+        criteria_val_raw = (m.group(3) or m.group(4) or m.group(5)).strip()
 
-        # Criteria is already extracted without quotes by regex
+        # Parse criteria for operator and value
+        operator_match = re.match(r'([<>=!]+)\s*(.*)', criteria_val_raw)
+        if operator_match:
+            op = operator_match.group(1)
+            val_str = operator_match.group(2).strip()
+            if op == '=':
+                op = '=='
+            elif op == '<>':
+                op = '!='
+
+            try:
+                val = float(val_str)
+                where_clause = f'"{col}" {op} {val}'
+            except ValueError:
+                where_clause = f'"{col}" {op} \'{val_str}\''
+        else:
+            # No operator, assume exact match
+            where_clause = f'"{col}" = \'{criteria_val_raw}\''
+
         result = self.conn.execute(
-            f'SELECT COUNT(*) FROM {sheet_name} WHERE \"{col}\" = \'{criteria_val}\''
+            f'SELECT COUNT(*) FROM {sheet_name} WHERE {where_clause}'
         ).fetchone()[0]
 
-        return int(result)
+        return float(result)
 
-    def _evaluate_scalar(self, formula: str, row_ctx: Dict[str, float]) -> float | str:
+    def _evaluate_scalar(self, formula: str, row_ctx: Dict[str, float]) -> Union[float, str]:
         """
         Phase 2: Evaluate scalar expression using numexpr for performance and security.
         Handles IF, arithmetic operations, VLOOKUP, and cell references.
@@ -154,6 +216,9 @@ class FormulaEvaluator:
         """
         # Remove leading = if present
         expr = formula.lstrip('=').strip()
+
+        # Convert Excel's <> to Python's != before other processing
+        expr = expr.replace('<>', '!=')
 
         # Substitute cell references with values from row_ctx
         for ref, value in row_ctx.items():
@@ -166,9 +231,8 @@ class FormulaEvaluator:
             expr = re.sub(rf'\b{re.escape(ref)}\b', replacement, expr)
 
         # Convert Excel's = to Python's == for equality comparisons
-        # Pattern: value="value" or value=value -> value=="value" or value==value
-        # But avoid converting == that's already there, or in function calls
-        expr = re.sub(r'(?<=[\w"\'])=', '==', expr)
+        # Only convert if not already ==, and avoid converting in function calls
+        expr = re.sub(r'(?<=[\w"\'])=(?!=)', '==', expr)
 
         # Handle VLOOKUP: VLOOKUP(lookup_value, table_array, col_index, range_lookup)
         # Check if formula is just a VLOOKUP (standalone, not part of larger expression)
@@ -179,6 +243,10 @@ class FormulaEvaluator:
         else:
             # VLOOKUP is part of larger expression - process it
             expr, vlookup_result = self._process_vlookup(expr)
+
+        # Check if this is an IF statement that returns strings (can't use numexpr)
+        if self._has_string_if_result(expr):
+            return self._evaluate_string_if(expr)
 
         # Handle IF statements: IF(condition, true_value, false_value)
         # This converts to Python ternary: (true_val if condition else false_val)
@@ -199,8 +267,65 @@ class FormulaEvaluator:
         except Exception as e:
             raise ValueError(f"Failed to evaluate expression '{expr}': {e}")
 
+    def _has_string_if_result(self, expr: str) -> bool:
+        """Check if the expression contains IF statements with string results."""
+        # Look for IF statements with quoted string values
+        if_pattern = r'IF\(([^,]+),([^,]+),([^)]+)\)'
+        matches = re.findall(if_pattern, expr)
+        for condition, true_val, false_val in matches:
+            # Check if either branch is a quoted string
+            if ('"' in true_val or '"' in false_val or "'" in true_val or "'" in false_val):
+                return True
+        return False
+
+    def _evaluate_string_if(self, expr: str) -> Union[float, str]:
+        """Evaluate IF statements with string results using Python eval."""
+        # Remove outer quotes for eval, but keep inner string quotes
+        expr = expr.strip()
+
+        # Process IF statements
+        if_pattern = r'IF\(([^,]+),([^,]+),([^)]+)\)'
+
+        def replace_if(m):
+            condition = m.group(1).strip()
+            true_val = m.group(2).strip()
+            false_val = m.group(3).strip()
+
+            # Recursively process nested IFs
+            condition = self._evaluate_string_if(condition) if 'IF(' in condition else condition
+            true_val = self._evaluate_string_if(true_val) if 'IF(' in true_val else true_val
+            false_val = self._evaluate_string_if(false_val) if 'IF(' in false_val else false_val
+
+            # Build Python eval expression
+            # Remove quotes from string values for eval, keep them for strings
+            def clean_val(v):
+                v = v.strip()
+                if (v.startswith('"') and v.endswith('"')) or (v.startswith("'") and v.endswith("'")):
+                    return v  # Keep quotes for strings
+                return v  # Return numbers/expressions as-is
+
+            true_val = clean_val(true_val)
+            false_val = clean_val(false_val)
+
+            return f"({true_val} if {condition} else {false_val})"
+
+        # Iteratively replace IF statements (from innermost first)
+        max_iterations = 10
+        for _ in range(max_iterations):
+            prev = expr
+            expr = re.sub(if_pattern, replace_if, expr)
+            if expr == prev:
+                break
+
+        # Evaluate using Python's eval (safe here since we control the input)
+        try:
+            result = eval(expr, {"__builtins__": {}}, {})
+            return result
+        except Exception as e:
+            raise ValueError(f"Failed to evaluate string IF expression '{expr}': {e}")
+
     def _process_if_statements(self, expr: str) -> str:
-        """Process nested IF statements."""
+        """Process nested IF statements. Only for numeric results."""
         # Pattern: IF(condition, true_val, false_val)
         if_pattern = r'IF\(([^,]+),([^,]+),([^)]+)\)'
 
@@ -221,9 +346,16 @@ class FormulaEvaluator:
         max_iterations = 10
         for _ in range(max_iterations):
             prev = expr
-            expr = re.sub(if_pattern, replace_if, expr)
-            if expr == prev:
+            # Find innermost IF first by using non-greedy matching
+            matches = list(re.finditer(r'IF\(([^(),]+(?:\([^()]*\))?[^(),]*),([^(),]+(?:\([^()]*\))?[^(),]*),([^()]+(?:\([^()]*\))?[^()]*)\)', expr))
+            if not matches:
                 break
+            # Process from end (innermost) to start
+            for m in reversed(matches):
+                original = m.group(0)
+                replacement = replace_if(m)
+                expr = expr.replace(original, replacement, 1)
+                break  # Process one replacement, then re-scan
 
         return expr
 
@@ -245,6 +377,7 @@ class FormulaEvaluator:
             # Get the source sheet data
             df = self.sheets_data.get(sheet)
             if df is None:
+                vlookup_result = 0
                 return "0"
 
             # Find the lookup column (first column in the range)
@@ -252,6 +385,7 @@ class FormulaEvaluator:
             lookup_col_idx = ord(lookup_col_letter.upper()) - ord('A')
 
             if lookup_col_idx >= len(df.columns):
+                vlookup_result = 0
                 return "0"
 
             lookup_col_name = df.columns[lookup_col_idx]
@@ -259,6 +393,7 @@ class FormulaEvaluator:
             # Find the return column
             return_col_idx = lookup_col_idx + col_offset
             if return_col_idx >= len(df.columns):
+                vlookup_result = 0
                 return "0"
 
             return_col_name = df.columns[return_col_idx]
@@ -268,13 +403,20 @@ class FormulaEvaluator:
                 # Try to convert lookup_val to number for numeric comparison
                 try:
                     numeric_lookup = float(lookup_val)
-                    # Try numeric comparison first
+                    lookup_series = df[lookup_col_name].astype(float)
+
                     if range_lookup:
-                        # Approximate match (find closest)
-                        result = df.iloc[(df[lookup_col_name].astype(float) - numeric_lookup).abs().argsort()[:1]]
+                        # Approximate match: find largest value <= lookup_val
+                        # Filter to values <= lookup_val, then take max
+                        valid_values = lookup_series[lookup_series <= numeric_lookup]
+                        if len(valid_values) > 0:
+                            idx = valid_values.idxmax()
+                            result = df.loc[[idx]]
+                        else:
+                            result = pd.DataFrame()
                     else:
                         # Exact match
-                        result = df[df[lookup_col_name].astype(float) == numeric_lookup]
+                        result = df[lookup_series == numeric_lookup]
                 except ValueError:
                     # String comparison
                     if range_lookup:
@@ -289,8 +431,10 @@ class FormulaEvaluator:
                     vlookup_result = val  # Store for return
                     # Return the actual value
                     return str(val)
+                vlookup_result = 0
                 return "0"
             except Exception:
+                vlookup_result = 0
                 return "0"
 
         new_expr = re.sub(vlookup_pattern, replace_vlookup, expr)
@@ -302,22 +446,20 @@ class FormulaEvaluator:
         Python ternary: (true_val if condition else false_val)
         numexpr format: where(condition, true_val, false_val)
         """
-        # Pattern: (true_val if condition else false_val)
-        # Note: Python ternary puts condition in the middle
-        # We need to capture: (value_if_true if condition else value_if_false)
-        pattern = r'\(([^:]+?)\s+if\s+([^:]+?)\s+else\s+([^)]+?)\)'
-
-        def convert_match(m):
-            true_val = m.group(1).strip()
-            condition = m.group(2).strip()
-            false_val = m.group(3).strip()
-            return f'where({condition}, {true_val}, {false_val})'
-
-        # Process nested ternary (innermost first)
-        max_iterations = 5
+        # Process from innermost to outermost
+        max_iterations = 10
         for _ in range(max_iterations):
             prev = expr
-            expr = re.sub(pattern, convert_match, expr)
+            # Find innermost ternary: (value_if_true if condition else value_if_false)
+            inner_pattern = r'\(([^():]+)\s+if\s+([^():]+)\s+else\s+([^():]+)\)'
+
+            def convert_match(m):
+                true_val = m.group(1).strip()
+                condition = m.group(2).strip()
+                false_val = m.group(3).strip()
+                return f'where({condition}, {true_val}, {false_val})'
+
+            expr = re.sub(inner_pattern, convert_match, expr)
             if expr == prev:
                 break
 
