@@ -1,6 +1,6 @@
 # DuckDB Excel Formula Evaluator
 
-A high-performance Excel formula evaluator using DuckDB for SQL-based evaluation.
+A Excel formula evaluator using DuckDB for SQL-based evaluation.
 
 ## Features
 
