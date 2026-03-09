@@ -376,16 +376,6 @@ TEST_CASES = [
         "row_ctx": {"D1": 100.0, "E1": 200.0},
         "expected": 150.0,  # (100+200)/2 = 150
     },
-    # Note: Nested IF with different comparison directions is not fully supported
-    # due to mixing of Python ternary and numexpr where() formats
-    # {
-    #     "technique": "Decision Table Testing",
-    #     "decision": "Nested IF with multiple references",
-    #     "name": "IF(D1>E1, D1, IF(E1>D1, E1, D1)) - max of two",
-    #     "formula": "=IF(D1>E1, D1, IF(E1>D1, E1, D1))",
-    #     "row_ctx": {"D1": 100.0, "E1": 200.0},
-    #     "expected": 200.0,  # 100>200 (FALSE), 200>100 (TRUE) → E1
-    # },
 
     # =========================================================================
     # TECHNIQUE 4: STATE TRANSITION TESTING
@@ -450,17 +440,6 @@ TEST_CASES = [
         "row_ctx": {"D1": 0.0},
         "expected": "Error",  # D1=0 triggers TRUE branch, returns "Error"
     },
-    # Note: numexpr evaluates both branches of where(), so division by zero
-    # in the FALSE branch still causes an error. This is a known limitation.
-    # {
-    #     "technique": "Error Guessing",
-    #     "error": "Division by zero (safe value)",
-    #     "name": "IF(D1!=0, 100/D1, 0) - protected division",
-    #     "formula": '=IF(D1!=0, 100/D1, 0)',
-    #     "row_ctx": {"D1": 0.0},
-    #     "expected": 0.0,  # D1!=0 is FALSE, returns 0
-    #     "expected_error": "ZeroDivisionError",  # numexpr limitation
-    # },
     {
         "technique": "Error Guessing",
         "error": "Division by zero (normal case)",
