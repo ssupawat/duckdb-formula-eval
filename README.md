@@ -9,19 +9,23 @@ A lightweight Excel formula evaluator library using pure DuckDB SQL for multi-st
 - **IF statements**: Conditional formulas with nested conditions
 - **Nested formulas**: Aggregates inside IF statements, IF with aggregate conditions
 - **Cross-sheet VLOOKUP**: Lookup values across different sheets
-- **Vectorized SQL evaluation**: 10-100x faster for simple arithmetic formulas
-- **Pure SQL architecture**: All evaluation happens within DuckDB, no external dependencies
+- **Vectorized SQL evaluation**: Optimized columnar operations
+- **Pure SQL architecture**: All evaluation happens within DuckDB
 
 ## Installation
 
-```bash
-pip install duckdb openpyxl pandas
-```
-
-Or using requirements.txt:
+**Recommended** - Install all dependencies from requirements.txt:
 
 ```bash
 pip install -r requirements.txt
+```
+
+This installs: `duckdb`, `openpyxl`, `pandas`, `formulas`, `psutil`
+
+**Manual installation:**
+
+```bash
+pip install duckdb openpyxl pandas formulas psutil
 ```
 
 ## Usage
@@ -38,17 +42,15 @@ excel_file = pd.ExcelFile('input.xlsx', engine='openpyxl')
 
 # Create DuckDB connection and load data
 conn = duckdb.connect(':memory:')
-sheets_data = {}
 
 for sheet_name in excel_file.sheet_names:
     df = pd.read_excel(excel_file, sheet_name=sheet_name, header=0, engine='openpyxl')
     df.columns = [str(c).lower().replace(' ', '_') for c in df.columns]
     table_name = sheet_name.lower().replace(' ', '_')
-    sheets_data[table_name] = df
     conn.register(table_name, df)
 
 # Create evaluator
-evaluator = FormulaEvaluator(conn, sheets_data)
+evaluator = FormulaEvaluator(conn)
 
 # Evaluate formula
 result = evaluator.evaluate_formula('=SUM(D:D)', 'sheet1')
@@ -63,13 +65,13 @@ print(result)  # 110.0
 
 ```python
 # Step 1: Apply formula to DuckDB table
-evaluator.apply_formula_to_column('=B2*1.1', 'sheet1', 'bonus', context_column='quantity')
+evaluator.apply_formula_to_column('=quantity*1.1', 'sheet1', 'bonus')
 
 # Step 2: Data changes (from another step in the pipeline)
 conn.execute("UPDATE sheet1 SET quantity = quantity * 2")
 
 # Step 3: Recalculate formulas
-evaluator.recalculate_all('sheet1')
+evaluator.recalculate_all()
 ```
 
 ## Supported Formula Types
@@ -125,39 +127,56 @@ Evaluate an Excel formula.
 
 **Returns:** Formula result as float or string
 
-### `apply_formula_to_column(formula, sheet_name, target_column, context_column=None)`
+### `apply_formula_to_column(formula, sheet_name, target_column)`
 Apply a formula to all rows in a target column.
 
 **Parameters:**
-- `formula` - Excel formula
+- `formula` - Excel formula (use column references like "quantity" not "B2")
 - `sheet_name` - Name of the sheet
 - `target_column` - Name of column to store results
-- `context_column` - Optional column for row context
 
 **Example:**
 ```python
-evaluator.apply_formula_to_column('=B2*0.1', 'sheet1', 'bonus', context_column='quantity')
+evaluator.apply_formula_to_column('=quantity*0.1', 'sheet1', 'bonus')
 ```
 
-### `recalculate_all(sheet_name=None)`
-Recalculate all formulas for a sheet.
+### `recalculate_all()`
+Recalculate all stored formulas across all sheets.
+
+**Example:**
+```python
+evaluator.recalculate_all()
+```
+
+### `excel_to_sql(formula, sheet_name, row_ctx=None)`
+Convert an Excel formula to SQL without executing it. Useful for debugging.
 
 **Parameters:**
-- `sheet_name` - Name of the sheet (if None, recalculate all sheets)
-
-### `store_formula_at_cell(formula, sheet_name, row, col)`
-Store a formula at a specific cell location.
-
-**Parameters:**
-- `formula` - Excel formula
+- `formula` - Excel formula (e.g., "=SUM(D:D)")
 - `sheet_name` - Name of the sheet
-- `row` - Row number (1-indexed)
-- `col` - Column letter (e.g., "A", "D")
+- `row_ctx` - Optional row context for cell references
+
+**Returns:** SQL query string
 
 **Example:**
 ```python
-evaluator.store_formula_at_cell('=SUM(A:A)', 'sheet1', row=1, col='F')
+sql = evaluator.excel_to_sql('=SUM(D:D)', 'sheet1')
+print(sql)  # SELECT (SELECT COALESCE(SUM("d"), 0) FROM sheet1)
 ```
+
+### `get_formulas()`
+Get all stored formulas.
+
+**Returns:** Dictionary mapping sheet names to their stored formulas
+
+**Example:**
+```python
+formulas = evaluator.get_formulas()
+# {'sheet1': {'bonus': '=quantity*0.1'}}
+```
+
+### `last_sql` attribute
+Contains the last generated SQL query (useful for debugging).
 
 ## Running Tests
 
@@ -188,7 +207,7 @@ python3 test_formula_evaluator.py
 ## Project Structure
 
 ```
-duckdb-formula-eval/
+duckdb-formula-demo/
 ├── .gitignore
 ├── README.md
 ├── requirements.txt
