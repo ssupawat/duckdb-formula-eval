@@ -598,16 +598,14 @@ def setup_evaluator(test_file: Path) -> FormulaEvaluator:
     """Arrange: Set up test fixtures (DuckDB connection, data, evaluator)."""
     conn = duckdb.connect(':memory:')
     excel_file = pd.ExcelFile(test_file, engine='openpyxl')
-    sheets_data = {}
 
     for sheet_name in excel_file.sheet_names:
         df = pd.read_excel(excel_file, sheet_name=sheet_name, header=0, engine='openpyxl')
         df.columns = [str(c).lower().replace(' ', '_') for c in df.columns]
         table_name = sheet_name.lower().replace(' ', '_')
-        sheets_data[table_name] = df
         conn.register(table_name, df)
 
-    return FormulaEvaluator(conn, sheets_data)
+    return FormulaEvaluator(conn)
 
 
 def run_test(test_case: Dict[str, Any], evaluator: FormulaEvaluator) -> bool:
@@ -622,12 +620,23 @@ def run_test(test_case: Dict[str, Any], evaluator: FormulaEvaluator) -> bool:
     expected_error = test_case.get("expected_error")
 
     try:
-        # Act: Execute the formula
-        result = evaluator.evaluate_formula(formula, 'sheet1', row_ctx)
+        # Act: Convert formula to SQL and execute in DuckDB
+        sql = evaluator.excel_to_sql(formula, 'sheet1', row_ctx)
 
-        # Debug: Show generated SQL if available
-        if hasattr(evaluator, 'last_sql'):
-            print(f"     SQL: {evaluator.last_sql}")
+        # Debug: Show generated SQL
+        print(f"     SQL: {sql}")
+
+        # Execute SQL in DuckDB and get result
+        result = evaluator.conn.execute(sql).fetchdf().iloc[0, 0]
+
+        # Handle NaN results
+        import pandas as pd
+        if pd.isna(result):
+            result = 0.0
+        elif isinstance(result, str):
+            pass  # Keep as string
+        else:
+            result = float(result)
 
         # If we expected an error but got a result, it's a failure
         if expected_error:

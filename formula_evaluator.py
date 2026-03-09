@@ -532,65 +532,6 @@ class FormulaEvaluator:
 
         return {'type': 'complex'}
 
-    def _evaluate_vectorized(self, formula: str, sheet_name: str, pattern: Dict[str, Any]) -> pd.Series:
-        """
-        Evaluate simple formulas on entire column using vectorized SQL.
-
-        Returns results as pandas Series for compatibility with existing code.
-        """
-        table_name = sheet_name.lower().replace(' ', '_')
-
-        if pattern['type'] == 'simple':
-            col1 = self._get_column_name(pattern['col1'], table_name)
-            col2 = self._get_column_name(pattern['col2'], table_name)
-            if col1 and col2:
-                sql = f'SELECT "{col1}" {pattern["op"]} "{col2}" FROM {table_name}'
-                return self.conn.execute(sql).fetchdf().iloc[:, 0]
-
-        elif pattern['type'] == 'scalar':
-            col = self._get_column_name(pattern['col'], table_name)
-            if col:
-                sql = f'SELECT "{col}" {pattern["op"]} {pattern["value"]} FROM {table_name}'
-                return self.conn.execute(sql).fetchdf().iloc[:, 0]
-
-        elif pattern['type'] == 'cross_sheet':
-            target_table = pattern['sheet'].lower().replace(' ', '_')
-            # Check if table exists in DuckDB
-            try:
-                self.conn.execute(f'SELECT 1 FROM {target_table} LIMIT 1')
-                col = self._get_column_name(pattern['col'], target_table)
-                if col:
-                    sql = f'SELECT "{col}" FROM {target_table}'
-                    return self.conn.execute(sql).fetchdf().iloc[:, 0]
-            except Exception:
-                pass  # Table doesn't exist
-
-        # === Handle IF statements ===
-        elif pattern['type'] == 'if':
-            # Pattern: IF(D2>100, D2*1.1, D2) - scalar comparison
-            if 'val' in pattern and 'result_val' in pattern:
-                col1 = self._get_column_name(pattern['col1'], table_name)
-                col_result = self._get_column_name(pattern['result_col'], table_name)
-                col_else = self._get_column_name(pattern['else_col'], table_name)
-                if col1 and col_result and col_else:
-                    sql = (f'SELECT CASE WHEN "{col1}" {pattern["op"]} {pattern["val"]} '
-                           f'THEN "{col_result}" {pattern["result_op"]} {pattern["result_val"]} '
-                           f'ELSE "{col_else}" END FROM {table_name}')
-                    return self.conn.execute(sql).fetchdf().iloc[:, 0]
-
-            # Pattern: IF(A2>B2, A2, B2) - column-column comparison
-            elif 'col2' in pattern:
-                col1 = self._get_column_name(pattern['col1'], table_name)
-                col2 = self._get_column_name(pattern['col2'], table_name)
-                col_result = self._get_column_name(pattern['result_col'], table_name)
-                col_else = self._get_column_name(pattern['else_col'], table_name)
-                if col1 and col2 and col_result and col_else:
-                    sql = (f'SELECT CASE WHEN "{col1}" {pattern["op"]} "{col2}" '
-                           f'THEN "{col_result}" ELSE "{col_else}" END FROM {table_name}')
-                    return self.conn.execute(sql).fetchdf().iloc[:, 0]
-
-        raise ValueError(f"Unsupported pattern: {pattern}")
-
     def _get_column_name(self, col_letter: str, table_name: str) -> Optional[str]:
         """
         Map Excel column letter to actual column name using DuckDB information_schema.
@@ -623,43 +564,6 @@ class FormulaEvaluator:
         if 0 <= col_idx < len(columns):
             return columns[col_idx]
         return None
-
-    # ========================================================================
-    # MAIN EVALUATION ENTRY POINT
-    # ========================================================================
-
-    def evaluate_formula(self, formula: str, sheet_name: str, row_ctx: Dict[str, float] = None) -> Union[float, str]:
-        """
-        Evaluate an Excel formula.
-
-        Args:
-            formula: Excel formula (e.g., "=SUM(D:D)", "=D1*1.1")
-            sheet_name: Name of the sheet containing the formula
-            row_ctx: Optional row context for cell references
-
-        Returns:
-            Formula result as float or string
-        """
-        # Check for vectorized patterns first (only if no row_ctx)
-        pattern = self._parse_formula_pattern(formula)
-        if row_ctx is None and pattern['type'] in ['simple', 'scalar', 'cross_sheet']:
-            try:
-                return self._evaluate_vectorized(formula, sheet_name, pattern).iloc[0]
-            except Exception:
-                pass  # Fall through to SQL evaluation
-
-        # Convert to SQL and execute
-        sql = self.excel_to_sql(formula, sheet_name, row_ctx)
-        self.last_sql = sql  # For debugging
-
-        result = self.conn.execute(sql).fetchdf().iloc[0, 0]
-
-        if pd.isna(result):
-            return 0.0
-        elif isinstance(result, str):
-            return result
-        else:
-            return float(result)
 
     # ========================================================================
     # PERSISTENCE METHODS (POC - simplified)

@@ -1,6 +1,6 @@
 # DuckDB Excel Formula Evaluator
 
-A lightweight Excel formula evaluator library using pure DuckDB SQL for multi-step pipeline integration.
+A lightweight Excel formula evaluator library that converts Excel formulas to DuckDB SQL and executes them entirely within DuckDB. No Python evaluation - all computation happens in DuckDB.
 
 ## Features
 
@@ -52,13 +52,16 @@ for sheet_name in excel_file.sheet_names:
 # Create evaluator
 evaluator = FormulaEvaluator(conn)
 
-# Evaluate formula
-result = evaluator.evaluate_formula('=SUM(D:D)', 'sheet1')
+# Apply formula to column (executes in DuckDB)
+evaluator.apply_formula_to_column('=amount*1.1', 'sheet1', 'bonus')
+
+# Get results by querying DuckDB
+result = conn.execute("SELECT SUM(bonus) FROM sheet1").fetchone()[0]
 print(result)  # 825.0
 
-# With row context for cell references
-result = evaluator.evaluate_formula('=IF(D1>80, D1*1.1, D1*0.9)', 'sheet1', {'D1': 100.0})
-print(result)  # 110.0
+# For debugging: see the SQL that would be generated
+sql = evaluator.excel_to_sql('=SUM(amount)', 'sheet1')
+print(sql)  # SELECT (SELECT COALESCE(SUM("amount"), 0) FROM sheet1)
 ```
 
 ### Multi-Step Pipeline Integration
@@ -67,11 +70,17 @@ print(result)  # 110.0
 # Step 1: Apply formula to DuckDB table
 evaluator.apply_formula_to_column('=quantity*1.1', 'sheet1', 'bonus')
 
-# Step 2: Data changes (from another step in the pipeline)
+# Step 2: Query results from DuckDB
+total_bonus = conn.execute("SELECT SUM(bonus) FROM sheet1").fetchone()[0]
+
+# Step 3: Data changes (from another step in the pipeline)
 conn.execute("UPDATE sheet1 SET quantity = quantity * 2")
 
-# Step 3: Recalculate formulas
+# Step 4: Recalculate formulas
 evaluator.recalculate_all()
+
+# Step 5: Query updated results
+total_bonus = conn.execute("SELECT SUM(bonus) FROM sheet1").fetchone()[0]
 ```
 
 ## Supported Formula Types
@@ -116,16 +125,6 @@ evaluator.recalculate_all()
 ```
 
 ## API Reference
-
-### `evaluate_formula(formula, sheet_name, row_ctx=None)`
-Evaluate an Excel formula.
-
-**Parameters:**
-- `formula` - Excel formula (e.g., "=SUM(D:D)")
-- `sheet_name` - Name of the sheet
-- `row_ctx` - Optional row context for cell references (e.g., {"D1": 100.0})
-
-**Returns:** Formula result as float or string
 
 ### `apply_formula_to_column(formula, sheet_name, target_column)`
 Apply a formula to all rows in a target column.
