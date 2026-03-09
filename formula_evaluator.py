@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
 """
-DuckDB Excel Formula Evaluator
+DuckDB Excel Formula Evaluator (POC)
 
-Evaluates Excel formulas using DuckDB for high-performance SQL-based evaluation.
-Supports aggregates, IF statements, VLOOKUP, and nested formulas.
+Simple POC for multi-step pipeline integration.
+Evaluates Excel formulas using pure DuckDB SQL.
 
 Supported formula types:
 - Pure aggregates: SUM, AVERAGE, MAX, MIN, COUNTIF, SUMIF
-- Pure scalar: arithmetic, IF statements
-- Nested: aggregate inside IF, IF with aggregate conditions
+- Scalar arithmetic: Basic math operations on cell references
+- IF statements: Conditional formulas with nested conditions
+- Nested formulas: Aggregates inside IF statements, IF with aggregate conditions
 - Arithmetic on aggregates: SUM(D:D)*0.1
 - Cross-sheet VLOOKUP
 """
@@ -16,12 +17,11 @@ Supported formula types:
 import re
 import duckdb
 import pandas as pd
-import numexpr
 from typing import Any, Dict, List, Tuple, Optional, Union
 
 
 class FormulaEvaluator:
-    """Evaluate Excel formulas using hybrid SQL + numexpr approach."""
+    """Evaluate Excel formulas using pure DuckDB SQL approach (POC)."""
 
     def __init__(self, conn: duckdb.DuckDBPyConnection, sheets_data: Dict[str, pd.DataFrame]):
         """
@@ -33,530 +33,673 @@ class FormulaEvaluator:
         """
         self.conn = conn
         self.sheets_data = sheets_data
+        self.last_sql = None  # Store last generated SQL for debugging
 
-    def _parse_formula_pattern(self, formula: str) -> Dict[str, Any]:
+        # Formula storage for recalculation
+        # Structure: {sheet_name: {formula_id: {"formula": "...", "target_column": "...", ...}}}
+        self.stored_formulas: Dict[str, Dict[str, Dict[str, Any]]] = {}
+
+    # ========================================================================
+    # PURE SQL CONVERSION METHODS
+    # ========================================================================
+
+    def excel_to_sql(self, formula: str, sheet_name: str, row_ctx: Dict[str, float] = None) -> str:
         """
-        Parse a formula to detect patterns that can be vectorized.
+        Convert Excel formula to pure DuckDB SQL.
+
+        Conversion pipeline order (critical):
+        1. String literals (double quotes) → SQL (single quotes)
+        2. VLOOKUP → SQL subqueries
+        3. Aggregates → SQL subqueries
+        4. IF → CASE expressions
+        5. Cell references → scalar values
+        6. Operators → SQL operators
+
+        Args:
+            formula: Excel formula (with or without leading =)
+            sheet_name: Name of the sheet containing the formula
+            row_ctx: Optional row context for cell references
 
         Returns:
-            {
-                'type': 'simple' | 'scalar' | 'cross_sheet' | 'complex',
-                'pattern': e.g., 'A+B' or 'A*2' or 'Sheet1!A',
-                'columns': list of column letters involved,
-                'source_sheet': for cross_sheet patterns
-            }
+            SQL SELECT statement that evaluates the formula
         """
         # Remove leading = and whitespace
-        formula = formula.lstrip('=').strip()
+        expr = formula.lstrip('=').strip()
 
-        # Simple arithmetic between two columns: A2+B2, A2*C2, etc.
-        simple_arithmetic = re.match(r'^([A-Z])\d+\s*([+\-*/])\s*([A-Z])\d+$', formula)
-        if simple_arithmetic:
-            return {
-                'type': 'simple',
-                'pattern': f'{simple_arithmetic.group(1)} {simple_arithmetic.group(2)} {simple_arithmetic.group(3)}',
-                'columns': [simple_arithmetic.group(1), simple_arithmetic.group(3)]
-            }
+        # Step 1: VLOOKUP → SQL subqueries (before string literal conversion!)
+        expr = self._convert_vlookup_to_sql(expr, sheet_name)
 
-        # Simple scalar operation on a column: A2*2, B2/10, etc.
-        simple_scalar = re.match(r'^([A-Z])\d+\s*([+\-*/])\s*(\d+(?:\.\d+)?)$', formula)
-        if simple_scalar:
-            return {
-                'type': 'scalar',
-                'pattern': f'{simple_scalar.group(1)} {simple_scalar.group(2)} {simple_scalar.group(3)}',
-                'columns': [simple_scalar.group(1)]
-            }
+        # Step 2: Convert string literals
+        expr = self._convert_string_literals(expr)
 
-        # Cross-sheet reference: Sheet1!A2
-        cross_sheet = re.match(r'^([A-Za-z0-9_]+)!([A-Z])\d+$', formula)
-        if cross_sheet:
-            return {
-                'type': 'cross_sheet',
-                'source_sheet': cross_sheet.group(1),
-                'column': cross_sheet.group(2)
-            }
+        # Step 3: Aggregates → SQL subqueries
+        expr = self._convert_aggregates_to_sql(expr, sheet_name)
 
-        # Complex formulas require the original two-phase approach
+        # Step 4: IF → CASE expressions
+        expr = self._convert_if_to_sql(expr)
+
+        # Step 5: Cell references → scalar values
+        if row_ctx:
+            expr = self._substitute_cell_references(expr, row_ctx)
+
+        # Step 6: Operators → SQL operators
+        expr = self._convert_operators(expr)
+
+        return f"SELECT {expr}"
+
+    def _convert_string_literals(self, formula: str) -> str:
+        """Convert Excel string literals (double quotes) to SQL (single quotes)."""
+        # Excel: "text" → SQL: 'text'
+        return formula.replace('"', "'")
+
+    def _convert_if_to_sql(self, formula: str) -> str:
+        """Convert Excel IF statements to SQL CASE expressions."""
+        # Pattern: IF(condition, true_value, false_value)
+        result = []
+        i = 0
+        expr = formula
+
+        while i < len(expr):
+            if expr[i:i+3] == 'IF(' and (i == 0 or not expr[i-1].isalnum()):
+                # Find matching closing parenthesis
+                depth = 1
+                j = i + 3
+                while j < len(expr) and depth > 0:
+                    if expr[j] == '(':
+                        depth += 1
+                    elif expr[j] == ')':
+                        depth -= 1
+                    j += 1
+
+                if depth == 0:
+                    # Extract IF content and parse parameters
+                    if_content = expr[i+3:j-1]
+                    params = self._split_if_params(if_content)
+
+                    if len(params) == 3:
+                        # Check if branches have mixed types (string and numeric)
+                        has_string_literal = any(
+                            (p.strip().startswith("'") and p.strip().endswith("'")) or
+                            (p.strip().startswith('"') and p.strip().endswith('"'))
+                            for p in [params[1], params[2]]
+                        )
+
+                        if has_string_literal:
+                            # Wrap both branches in CAST to VARCHAR for type compatibility
+                            case_expr = f"CASE WHEN {params[0]} THEN CAST({params[1]} AS VARCHAR) ELSE CAST({params[2]} AS VARCHAR) END"
+                        else:
+                            case_expr = f"CASE WHEN {params[0]} THEN {params[1]} ELSE {params[2]} END"
+                        result.append(case_expr)
+                        i = j
+                        continue
+
+            result.append(expr[i])
+            i += 1
+
+        return ''.join(result)
+
+    def _split_if_params(self, s: str) -> list:
+        """Split IF parameters, respecting nested parentheses and strings."""
+        params = []
+        current = []
+        depth = 0
+        in_string = False
+        string_char = None
+
+        for char in s:
+            if char in ('"', "'") and (in_string is False or string_char == char):
+                in_string = not in_string
+                if in_string:
+                    string_char = char
+                else:
+                    string_char = None
+                current.append(char)
+            elif in_string:
+                current.append(char)
+            elif char == '(':
+                depth += 1
+                current.append(char)
+            elif char == ')':
+                depth -= 1
+                current.append(char)
+            elif char == ',' and depth == 0:
+                params.append(''.join(current).strip())
+                current = []
+            else:
+                current.append(char)
+
+        if current:
+            params.append(''.join(current).strip())
+
+        return params
+
+    def _convert_aggregates_to_sql(self, formula: str, sheet_name: str) -> str:
+        """Convert Excel aggregate functions to SQL subqueries."""
+        table_name = sheet_name.lower().replace(' ', '_')
+        df = self.sheets_data.get(table_name)
+        if df is None:
+            return formula
+
+        # Handle COUNT(D:D) pattern
+        formula = re.sub(
+            r'COUNT\(([A-Z]):([A-Z])\)',
+            lambda m: self._count_to_sql(m, table_name),
+            formula
+        )
+
+        # Handle SUM(D:D) pattern
+        formula = re.sub(
+            r'SUM\(([A-Z]):([A-Z])\)',
+            lambda m: self._sum_to_sql(m, table_name),
+            formula
+        )
+
+        # Handle AVERAGE(D:D) pattern
+        formula = re.sub(
+            r'AVERAGE\(([A-Z]):([A-Z])\)',
+            lambda m: self._average_to_sql(m, table_name),
+            formula
+        )
+
+        # Handle MAX(D:D) pattern
+        formula = re.sub(
+            r'MAX\(([A-Z]):([A-Z])\)',
+            lambda m: self._max_to_sql(m, table_name),
+            formula
+        )
+
+        # Handle MIN(D:D) pattern
+        formula = re.sub(
+            r'MIN\(([A-Z]):([A-Z])\)',
+            lambda m: self._min_to_sql(m, table_name),
+            formula
+        )
+
+        # Handle COUNTIF(C:C,">100") pattern - with comparison operators (FIRST!)
+        formula = re.sub(
+            r'COUNTIF\(([A-Z]):([A-Z]),\s*"((?:[<>]=?|<>|=)(?:\d+(?:\.\d+)?))"\)',
+            lambda m: self._countif_op_to_sql(m, table_name),
+            formula
+        )
+
+        # Handle COUNTIF(C:C,'>100') pattern - single quotes with operators
+        formula = re.sub(
+            r"COUNTIF\(([A-Z]):([A-Z]),\s*'((?:[<>]=?|<>|=)(?:\d+(?:\.\d+)?))'\)",
+            lambda m: self._countif_op_to_sql(m, table_name),
+            formula
+        )
+
+        # Handle COUNTIF(C:C,"x") pattern - simple equality
+        formula = re.sub(
+            r'COUNTIF\(([A-Z]):([A-Z]),\s*"([^"]*)"\)',
+            lambda m: self._countif_to_sql(m, table_name),
+            formula
+        )
+
+        # Handle COUNTIF(C:C,'x') pattern (single quotes)
+        formula = re.sub(
+            r"COUNTIF\(([A-Z]):([A-Z]),\s*'([^']*)'\)",
+            lambda m: self._countif_to_sql(m, table_name),
+            formula
+        )
+
+        # Handle SUMIF(C:C,">100",D:D) pattern - with comparison operators (FIRST!)
+        formula = re.sub(
+            r'SUMIF\(([A-Z]):([A-Z]),\s*"((?:[<>]=?|<>|=)(?:\d+(?:\.\d+)?))",\s*([A-Z]):([A-Z])\)',
+            lambda m: self._sumif_op_to_sql(m, table_name),
+            formula
+        )
+
+        # Handle SUMIF(C:C,'>100',D:D) pattern - single quotes with operators
+        formula = re.sub(
+            r"SUMIF\(([A-Z]):([A-Z]),\s*'((?:[<>]=?|<>|=)(?:\d+(?:\.\d+)?))',\s*([A-Z]):([A-Z])\)",
+            lambda m: self._sumif_op_to_sql(m, table_name),
+            formula
+        )
+
+        # Handle SUMIF(C:C,"",D:D) pattern - empty criteria (BEFORE simple equality!)
+        formula = re.sub(
+            r'SUMIF\(([A-Z]):([A-Z]),\s*"",\s*([A-Z]):([A-Z])\)',
+            lambda m: '0',  # Empty criteria matches no cells
+            formula
+        )
+
+        # Handle SUMIF(C:C,'',D:D) pattern - empty criteria with single quotes
+        formula = re.sub(
+            r"SUMIF\(([A-Z]):([A-Z]),\s*'',\s*([A-Z]):([A-Z])\)",
+            lambda m: '0',  # Empty criteria matches no cells
+            formula
+        )
+
+        # Handle SUMIF(C:C,"x",D:D) pattern - simple equality
+        formula = re.sub(
+            r'SUMIF\(([A-Z]):([A-Z]),\s*"([^"]*)",\s*([A-Z]):([A-Z])\)',
+            lambda m: self._sumif_to_sql(m, table_name),
+            formula
+        )
+
+        # Handle SUMIF(C:C,'x',D:D) pattern (single quotes)
+        formula = re.sub(
+            r"SUMIF\(([A-Z]):([A-Z]),\s*'([^']*)',\s*([A-Z]):([A-Z])\)",
+            lambda m: self._sumif_to_sql(m, table_name),
+            formula
+        )
+
+        return formula
+
+    def _convert_vlookup_to_sql(self, formula: str, sheet_name: str) -> str:
+        """Convert VLOOKUP to SQL subquery."""
+        # VLOOKUP("value", Sheet2!A:B, 2, 0) or VLOOKUP(A1, Sheet2!A:B, 2, 0)
+        pattern = r'VLOOKUP\(("([^"]*)"|([^,]+)),\s*([A-Za-z0-9_]+)!([A-Z]):([A-Z]),\s*(\d+),\s*([01])\)'
+
+        def replace_vlookup(m):
+            lookup_value = m.group(2) or m.group(3)  # Either "value" or A1
+            target_sheet = m.group(4)
+            col_start = m.group(5)
+            col_end = m.group(6)
+            col_index = int(m.group(7))
+            range_lookup = int(m.group(8))
+
+            target_table = target_sheet.lower().replace(' ', '_')
+
+            # Check if target table exists
+            if target_table not in self.sheets_data:
+                return '0'
+
+            # Get column names
+            lookup_col = self._get_column_name(col_start, target_table)
+            return_col_name = chr(ord(col_start) + col_index - 1)
+            return_col = self._get_column_name(return_col_name, target_table)
+
+            if not lookup_col or not return_col:
+                return '0'
+
+            # If lookup_value is a cell reference, keep it for substitution
+            if re.match(r'^[A-Z]\d+$', lookup_value):
+                lookup_sql = lookup_value
+            elif re.match(r'^\d+(?:\.\d+)?$', lookup_value):
+                # Numeric literal
+                lookup_sql = lookup_value
+            else:
+                # String literal - Excel uses double quotes, SQL uses single quotes
+                lookup_sql = f"'{lookup_value}'"
+
+            if range_lookup == 0:
+                # Exact match
+                sql = f"(SELECT COALESCE((SELECT {return_col} FROM {target_table} WHERE {lookup_col} = {lookup_sql} LIMIT 1), NULL))"
+            else:
+                # Approximate match (range_lookup=1): Find largest value ≤ lookup_value
+                sql = f"(SELECT COALESCE((SELECT {return_col} FROM {target_table} WHERE {lookup_col} <= {lookup_sql} ORDER BY {lookup_col} DESC LIMIT 1), NULL))"
+            return sql
+
+        return re.sub(pattern, replace_vlookup, formula)
+
+    def _substitute_cell_references(self, formula: str, row_ctx: Dict[str, float]) -> str:
+        """Substitute cell references with scalar values from row context."""
+        result = []
+        i = 0
+
+        while i < len(formula):
+            if formula[i].isalpha() and i + 1 < len(formula) and formula[i + 1].isdigit():
+                # Found cell reference like A1, B2
+                cell_ref = formula[i:i + 2]
+
+                if cell_ref in row_ctx:
+                    value = row_ctx[cell_ref]
+                    if isinstance(value, str):
+                        result.append(f"'{value}'")
+                    else:
+                        result.append(str(value))
+                    i += 2
+                    continue
+
+            result.append(formula[i])
+            i += 1
+
+        return ''.join(result)
+
+    def _convert_operators(self, formula: str) -> str:
+        """Convert Excel operators to SQL operators."""
+        # Excel <> → SQL !=
+        formula = formula.replace('<>', '!=')
+        # Excel = for comparison → SQL == (but need to be careful not to replace in CASE)
+        # This is handled in the context of SQL expressions
+        return formula
+
+    # Aggregate conversion methods
+    def _sum_to_sql(self, m: re.Match, table_name: str) -> str:
+        col = self._get_column_name(m.group(1), table_name)
+        if not col:
+            return '0'
+        return f"(SELECT COALESCE(SUM(\"{col}\"), 0) FROM {table_name})"
+
+    def _average_to_sql(self, m: re.Match, table_name: str) -> str:
+        col = self._get_column_name(m.group(1), table_name)
+        if not col:
+            return '0'
+        return f"(SELECT COALESCE(AVG(\"{col}\"), 0) FROM {table_name})"
+
+    def _max_to_sql(self, m: re.Match, table_name: str) -> str:
+        col = self._get_column_name(m.group(1), table_name)
+        if not col:
+            return '0'
+        return f"(SELECT COALESCE(MAX(\"{col}\"), 0) FROM {table_name})"
+
+    def _min_to_sql(self, m: re.Match, table_name: str) -> str:
+        col = self._get_column_name(m.group(1), table_name)
+        if not col:
+            return '0'
+        return f"(SELECT COALESCE(MIN(\"{col}\"), 0) FROM {table_name})"
+
+    def _count_to_sql(self, m: re.Match, table_name: str) -> str:
+        """Convert COUNT(D:D) to SQL, handling non-existent columns."""
+        col = self._get_column_name(m.group(1), table_name)
+        if not col:
+            return '0'  # Column doesn't exist, return 0
+        return f"(SELECT COUNT(*) FROM {table_name})"
+
+    def _countif_to_sql(self, m: re.Match, table_name: str) -> str:
+        criteria = m.group(3)
+        col = self._get_column_name(m.group(1), table_name)
+        if not col:
+            return '0'
+        return f"(SELECT COUNT(*) FROM {table_name} WHERE \"{col}\" = '{criteria}')"
+
+    def _countif_op_to_sql(self, m: re.Match, table_name: str) -> str:
+        """Handle COUNTIF with comparison operators like >100, <=50"""
+        criteria = m.group(3)  # e.g., ">100"
+        col = self._get_column_name(m.group(1), table_name)
+        if not col:
+            return '0'
+        return f"(SELECT COUNT(*) FROM {table_name} WHERE \"{col}\" {criteria})"
+
+    def _sumif_to_sql(self, m: re.Match, table_name: str) -> str:
+        criteria = m.group(3)
+        filter_col = self._get_column_name(m.group(1), table_name)
+        sum_col = self._get_column_name(m.group(4), table_name)
+        if not filter_col or not sum_col:
+            return '0'
+        return f"(SELECT COALESCE(SUM(\"{sum_col}\"), 0) FROM {table_name} WHERE \"{filter_col}\" = '{criteria}')"
+
+    def _sumif_op_to_sql(self, m: re.Match, table_name: str) -> str:
+        """Handle SUMIF with comparison operators like ">100" """
+        criteria = m.group(3)  # e.g., ">100"
+        filter_col = self._get_column_name(m.group(1), table_name)
+        sum_col = self._get_column_name(m.group(5), table_name)
+        if not filter_col or not sum_col:
+            return '0'
+        return f"(SELECT COALESCE(SUM(\"{sum_col}\"), 0) FROM {table_name} WHERE \"{filter_col}\" {criteria})"
+
+    # ========================================================================
+    # PATTERN DETECTION & VECTORIZED EVALUATION
+    # ========================================================================
+
+    def _parse_formula_pattern(self, formula: str) -> Dict[str, Any]:
+        """Detect simple formula patterns for vectorized evaluation."""
+        formula_clean = formula.lstrip('=').strip().upper()
+
+        # Pattern: A2+B2 (two columns with operator)
+        match = re.match(r'^([A-Z])\d+\s*([+\-*/])\s*([A-Z])\d+$', formula_clean)
+        if match:
+            return {'type': 'simple', 'col1': match.group(1), 'op': match.group(2), 'col2': match.group(3)}
+
+        # Pattern: A2*2 (column with scalar)
+        match = re.match(r'^([A-Z])\d+\s*([+\-*/])\s*(\d+(?:\.\d+)?)$', formula_clean)
+        if match:
+            return {'type': 'scalar', 'col': match.group(1), 'op': match.group(2), 'value': match.group(3)}
+
+        # Pattern: Sheet1!A2 (cross-sheet reference)
+        match = re.match(r'^([A-Za-z0-9_]+)!([A-Z])\d+$', formula_clean)
+        if match:
+            return {'type': 'cross_sheet', 'sheet': match.group(1), 'col': match.group(2)}
+
         return {'type': 'complex'}
 
     def _evaluate_vectorized(self, formula: str, sheet_name: str, pattern: Dict[str, Any]) -> pd.Series:
-        """
-        Evaluate simple formulas using vectorized SQL for entire columns.
+        """Evaluate simple formulas on entire column using vectorized SQL."""
+        table_name = sheet_name.lower().replace(' ', '_')
+        df = self.sheets_data.get(table_name)
+        if df is None:
+            raise ValueError(f"Sheet '{sheet_name}' not found")
 
-        Returns a pandas Series with the results for all rows.
+        if pattern['type'] == 'simple':
+            col1 = self._get_column_name(pattern['col1'], table_name)
+            col2 = self._get_column_name(pattern['col2'], table_name)
+            if col1 and col2:
+                sql = f'SELECT "{col1}" {pattern["op"]} "{col2}" FROM {table_name}'
+                return self.conn.execute(sql).fetchdf().iloc[:, 0]
+
+        elif pattern['type'] == 'scalar':
+            col = self._get_column_name(pattern['col'], table_name)
+            if col:
+                sql = f'SELECT "{col}" {pattern["op"]} {pattern["value"]} FROM {table_name}'
+                return self.conn.execute(sql).fetchdf().iloc[:, 0]
+
+        raise ValueError(f"Unsupported pattern: {pattern}")
+
+    def _get_column_name(self, col_letter: str, sheet_name: str) -> Optional[str]:
+        """Map Excel column letter to actual column name."""
+        df = self.sheets_data.get(sheet_name)
+        if df is None:
+            return None
+
+        col_idx = ord(col_letter.upper()) - ord('A')
+        if 0 <= col_idx < len(df.columns):
+            return df.columns[col_idx]
+        return None
+
+    # ========================================================================
+    # MAIN EVALUATION ENTRY POINT
+    # ========================================================================
+
+    def evaluate_formula(self, formula: str, sheet_name: str, row_ctx: Dict[str, float] = None) -> Union[float, str]:
+        """
+        Evaluate an Excel formula.
+
+        Args:
+            formula: Excel formula (e.g., "=SUM(D:D)", "=D1*1.1")
+            sheet_name: Name of the sheet containing the formula
+            row_ctx: Optional row context for cell references
+
+        Returns:
+            Formula result as float or string
+        """
+        # Check for vectorized patterns first (only if no row_ctx)
+        pattern = self._parse_formula_pattern(formula)
+        if row_ctx is None and pattern['type'] in ['simple', 'scalar', 'cross_sheet']:
+            try:
+                return self._evaluate_vectorized(formula, sheet_name, pattern).iloc[0]
+            except Exception:
+                pass  # Fall through to SQL evaluation
+
+        # Convert to SQL and execute
+        sql = self.excel_to_sql(formula, sheet_name, row_ctx)
+        self.last_sql = sql  # For debugging
+
+        result = self.conn.execute(sql).fetchdf().iloc[0, 0]
+
+        if pd.isna(result):
+            return 0.0
+        elif isinstance(result, str):
+            return result
+        else:
+            return float(result)
+
+    # ========================================================================
+    # PERSISTENCE METHODS (POC - simplified)
+    # ========================================================================
+
+    def apply_formula_to_column(
+        self,
+        formula: str,
+        sheet_name: str,
+        target_column: str,
+        context_column: str = None,
+        store_formula: bool = True
+    ) -> None:
+        """
+        Apply a formula to all rows in a target column.
+
+        This evaluates the formula for each row and stores the results in the target column.
+        If the target column doesn't exist, it will be created.
+
+        Args:
+            formula: Excel formula (e.g., "=D2*1.1", "=IF(D2>100, D2*1.1, D2)")
+            sheet_name: Name of the sheet
+            target_column: Name of column to store results (creates if doesn't exist)
+            context_column: Optional column to use for row context (e.g., "D" for D2 references)
+
+        Example:
+            # Create a new "bonus" column with 10% increase
+            evaluator.apply_formula_to_column('=D2*1.1', 'sheet1', 'bonus', context_column='amount')
         """
         table_name = sheet_name.lower().replace(' ', '_')
         df = self.sheets_data.get(table_name)
         if df is None:
             raise ValueError(f"Sheet '{sheet_name}' not found")
 
-        # Build column mapping: Excel letter (A, B, C) to actual column name
-        col_map = {chr(ord('A') + i): df.columns[i] for i in range(len(df.columns))}
+        # Check if target column exists
+        if target_column not in df.columns:
+            df[target_column] = None
 
-        if pattern['type'] == 'simple':
-            # Two-column arithmetic: A+B, A-C, etc.
-            parts = pattern['pattern'].split()
-            col1 = col_map[parts[0]]
-            op = parts[1]
-            col2 = col_map[parts[2]]
+        # Evaluate formula for each row
+        results = []
+        for idx, row in df.iterrows():
+            # Build row context from context_column if specified
+            row_ctx = {}
+            if context_column and context_column in df.columns:
+                # Map context column to Excel cell reference
+                col_idx = df.columns.get_loc(context_column)
+                col_letter = chr(ord('A') + col_idx)
+                cell_ref = f"{col_letter}{idx + 2}"
+                row_ctx[cell_ref] = row[context_column]
 
-            sql_expr = f'"{col1}" {op} "{col2}"'
-            result_df = self.conn.execute(f'SELECT {sql_expr} FROM {table_name}').fetchdf()
-            return result_df.iloc[:, 0]
+            # Evaluate formula for this row
+            try:
+                result = self.evaluate_formula(formula, sheet_name, row_ctx)
+                results.append(result)
+            except Exception as e:
+                results.append(None)
 
-        elif pattern['type'] == 'scalar':
-            # Column with scalar: A*2, B/10, etc.
-            parts = pattern['pattern'].split()
-            col = col_map[parts[0]]
-            op = parts[1]
-            scalar_val = parts[2]
+        # Update DataFrame with results
+        df[target_column] = results
 
-            sql_expr = f'"{col}" {op} {scalar_val}'
-            result_df = self.conn.execute(f'SELECT {sql_expr} FROM {table_name}').fetchdf()
-            return result_df.iloc[:, 0]
+        # Recreate table with new data
+        self._recreate_table_from_dataframe(sheet_name, df)
 
-        elif pattern['type'] == 'cross_sheet':
-            # Reference to another sheet: Sheet1!A
-            source_table = pattern['source_sheet'].lower().replace(' ', '_')
-            source_df = self.sheets_data.get(source_table)
-            if source_df is None:
-                raise ValueError(f"Source sheet '{pattern['source_sheet']}' not found")
+        # Store formula for recalculation
+        if store_formula:
+            formula_id = f"{target_column}_formula"
+            if table_name not in self.stored_formulas:
+                self.stored_formulas[table_name] = {}
+            self.stored_formulas[table_name][formula_id] = {
+                "formula": formula,
+                "target_column": target_column
+            }
 
-            source_col_map = {chr(ord('A') + i): source_df.columns[i] for i in range(len(source_df.columns))}
-            source_col = source_col_map[pattern['column']]
+    def _recreate_table_from_dataframe(self, sheet_name: str, df: pd.DataFrame) -> None:
+        """Recreate a DuckDB table from a DataFrame."""
+        table_name = sheet_name.lower().replace(' ', '_')
+        temp_table = f"{table_name}_new"
 
-            result_df = self.conn.execute(f'SELECT "{source_col}" FROM {source_table}').fetchdf()
-            return result_df.iloc[:, 0]
+        # Create new table with the DataFrame data
+        df.to_sql(
+            name=temp_table,
+            con=self.conn,
+            index=False,
+            if_exists='replace'
+        )
 
-        raise ValueError(f"Unsupported pattern type: {pattern['type']}")
+        # Drop old table and rename new one
+        self.conn.execute(f'DROP TABLE IF EXISTS {table_name}')
+        self.conn.execute(f'ALTER TABLE {temp_table} RENAME TO {table_name}')
 
-    def evaluate_formula(self, formula: str, sheet_name: str, row_ctx: Dict[str, float] = None) -> Union[float, str]:
+        # Update the cached DataFrame
+        self.sheets_data[table_name] = df
+
+    def store_formula_at_cell(
+        self,
+        formula: str,
+        sheet_name: str,
+        row: int,
+        col: str
+    ) -> None:
         """
-        Evaluate a formula using two-phase approach:
-        Phase 1: Extract and compute all aggregates using SQL
-        Phase 2: Substitute aggregates and evaluate scalar expression
+        Store a formula at a specific cell location (Excel-style).
 
         Args:
-            formula: Excel formula (e.g., "=SUM(A:A)", "=IF(D1>80, D1*1.1, D1*0.9)")
-            sheet_name: Name of the sheet containing the formula
-            row_ctx: Optional row context for cell references (e.g., {"D1": 100.0})
+            formula: Excel formula (e.g., "=SUM(A:A)")
+            sheet_name: Name of the sheet
+            row: Row number (1-indexed, like Excel)
+            col: Column letter (e.g., "A", "D")
+
+        Example:
+            evaluator.store_formula_at_cell('=SUM(A:A)', 'sheet1', row=1, col='F')
+        """
+        table_name = sheet_name.lower().replace(' ', '_')
+        cell_ref = f"{col}{row}"
+
+        if table_name not in self.stored_formulas:
+            self.stored_formulas[table_name] = {}
+
+        self.stored_formulas[table_name][cell_ref] = {
+            "formula": formula,
+            "row": row,
+            "col": col
+        }
+
+    # ========================================================================
+    # RECALCULATION (POC - simple recalculate all)
+    # ========================================================================
+
+    def recalculate_all(self, sheet_name: str = None) -> None:
+        """
+        Recalculate all formulas for a sheet.
+
+        Args:
+            sheet_name: Name of the sheet (if None, recalculate all sheets)
+        """
+        tables_to_recalc = []
+        if sheet_name:
+            table_name = sheet_name.lower().replace(' ', '_')
+            if table_name in self.stored_formulas:
+                tables_to_recalc.append(table_name)
+        else:
+            tables_to_recalc = list(self.stored_formulas.keys())
+
+        for table_name in tables_to_recalc:
+            formulas = self.stored_formulas.get(table_name, {})
+            sheet_name = table_name.replace('_', ' ').title()
+
+            for formula_id, formula_data in formulas.items():
+                formula = formula_data["formula"]
+                target_column = formula_data.get("target_column")
+
+                if target_column:
+                    # Column formula - reapply to entire column
+                    self.apply_formula_to_column(
+                        formula,
+                        sheet_name,
+                        target_column,
+                        store_formula=False  # Already stored
+                    )
+
+    def get_stored_formulas(self, sheet_name: str = None) -> Dict[str, Dict]:
+        """
+        Get all stored formulas.
+
+        Args:
+            sheet_name: Optional sheet name (if None, return all)
 
         Returns:
-            Either a numeric value or a string (for VLOOKUP results)
+            Dictionary of stored formulas
         """
-        simplified = self._resolve_aggregates(formula, sheet_name)
-        return self._evaluate_scalar(simplified, row_ctx or {})
-
-    def _resolve_aggregates(self, formula: str, sheet_name: str) -> str:
-        """Phase 1: Replace all aggregate functions with their computed values."""
-        result = formula
-
-        # Patterns with their SQL equivalents (most specific first)
-        patterns = [
-            # SUMIF/COUNTIF with criteria - handle both quote styles and unquoted criteria
-            (r'SUMIF\(([A-Z]+):([A-Z]+),\s*(?:\"([^\"]+)\"|\'([^\']+)\'|([^,)]+)),([A-Z]+):([A-Z]+)\)', self._sumif),
-            (r'COUNTIF\(([A-Z]+):([A-Z]+),\s*(?:\"([^\"]+)\"|\'([^\']+)\'|([^,)]+))\)', self._countif),
-
-            # Basic aggregates
-            (r'SUM\(([A-Z]+):([A-Z]+)\)', self._sum),
-            (r'AVERAGE\(([A-Z]+):([A-Z]+)\)', self._average),
-            (r'MAX\(([A-Z]+):([A-Z]+)\)', self._max),
-            (r'MIN\(([A-Z]+):([A-Z]+)\)', self._min),
-            (r'COUNT\(([A-Z]+):([A-Z]+)\)', self._count),
-        ]
-
-        # Iteratively resolve aggregates (handles nesting)
-        max_iterations = 10
-        for _ in range(max_iterations):
-            prev_result = result
-            for pattern, handler in patterns:
-                def replace_match(m):
-                    return str(handler(m, sheet_name))
-
-                result = re.sub(pattern, replace_match, result, flags=re.IGNORECASE)
-
-            if result == prev_result:
-                break  # No more changes
-
-        return result
-
-    def _get_column_name(self, col_letter: str, sheet_name: str) -> Optional[str]:
-        """Map Excel column letter to actual column name in the sheet. Returns None if column doesn't exist."""
-        df = self.sheets_data.get(sheet_name.lower().replace(' ', '_'))
-        if df is None:
-            return None
-
-        # Column letter to index (A=0, B=1, etc.)
-        col_idx = ord(col_letter.upper()) - ord('A')
-        if col_idx < len(df.columns):
-            return df.columns[col_idx]
-        return None
-
-    def _sum(self, m: re.Match, sheet_name: str) -> float:
-        col = self._get_column_name(m.group(1), sheet_name)
-        if col is None:
-            return 0.0
-        result = self.conn.execute(f"SELECT COALESCE(SUM(\"{col}\"), 0) FROM {sheet_name}").fetchone()[0]
-        return float(result)
-
-    def _average(self, m: re.Match, sheet_name: str) -> float:
-        col = self._get_column_name(m.group(1), sheet_name)
-        if col is None:
-            return 0.0
-        result = self.conn.execute(f"SELECT COALESCE(AVG(\"{col}\"), 0) FROM {sheet_name}").fetchone()[0]
-        return float(result)
-
-    def _max(self, m: re.Match, sheet_name: str) -> float:
-        col = self._get_column_name(m.group(1), sheet_name)
-        if col is None:
-            return 0.0
-        result = self.conn.execute(f"SELECT COALESCE(MAX(\"{col}\"), 0) FROM {sheet_name}").fetchone()[0]
-        return float(result)
-
-    def _min(self, m: re.Match, sheet_name: str) -> float:
-        col = self._get_column_name(m.group(1), sheet_name)
-        if col is None:
-            return 0.0
-        result = self.conn.execute(f"SELECT COALESCE(MIN(\"{col}\"), 0) FROM {sheet_name}").fetchone()[0]
-        return float(result)
-
-    def _count(self, m: re.Match, sheet_name: str) -> float:
-        col = self._get_column_name(m.group(1), sheet_name)
-        if col is None:
-            return 0.0
-        result = self.conn.execute(f"SELECT COUNT(*) FROM {sheet_name} WHERE \"{col}\" IS NOT NULL").fetchone()[0]
-        return float(result)
-
-    def _sumif(self, m: re.Match, sheet_name: str) -> float:
-        criteria_col = self._get_column_name(m.group(1), sheet_name)
-        if criteria_col is None:
-            return 0.0
-        # Extract criteria_val from the correct group (3, 4, or 5)
-        # Groups 3 and 4 are quoted (already stripped by regex), group 5 is unquoted
-        criteria_val_raw = (m.group(3) or m.group(4) or m.group(5) or "").strip()
-        sum_col = self._get_column_name(m.group(6), sheet_name)
-        if sum_col is None:
-            return 0.0
-
-        # Handle empty criteria
-        if not criteria_val_raw or criteria_val_raw == '""':
-            # Empty criteria matches NULL/empty cells
-            where_clause = f'"{criteria_col}" IS NULL'
+        if sheet_name:
+            table_name = sheet_name.lower().replace(' ', '_')
+            return {sheet_name: self.stored_formulas.get(table_name, {})}
         else:
-            # Parse criteria for operator and value
-            operator_match = re.match(r'([<>=!]+)\s*(.*)', criteria_val_raw)
-            if operator_match:
-                op = operator_match.group(1)
-                val_str = operator_match.group(2).strip()
-                # Convert operators
-                if op == '=':
-                    op = '=='
-                elif op == '<>':
-                    op = '!='
-
-                try:
-                    # Try to convert value to a number for comparison
-                    val = float(val_str)
-                    where_clause = f'"{criteria_col}" {op} {val}'
-                except ValueError:
-                    # If not a number, treat as string literal (e.g., "=Text")
-                    where_clause = f'"{criteria_col}" {op} \'{val_str}\''
-            else:
-                # No operator, assume exact match
-                where_clause = f'"{criteria_col}" = \'{criteria_val_raw}\''
-
-        result = self.conn.execute(
-            f'SELECT COALESCE(SUM(\"{sum_col}\"), 0) FROM {sheet_name} WHERE {where_clause}'
-        ).fetchone()[0]
-
-        return float(result)
-
-    def _countif(self, m: re.Match, sheet_name: str) -> float:
-        col = self._get_column_name(m.group(1), sheet_name)
-        if col is None:
-            return 0.0
-        # Extract criteria_val from the correct group (3, 4, or 5)
-        criteria_val_raw = (m.group(3) or m.group(4) or m.group(5)).strip()
-
-        # Parse criteria for operator and value
-        operator_match = re.match(r'([<>=!]+)\s*(.*)', criteria_val_raw)
-        if operator_match:
-            op = operator_match.group(1)
-            val_str = operator_match.group(2).strip()
-            if op == '=':
-                op = '=='
-            elif op == '<>':
-                op = '!='
-
-            try:
-                val = float(val_str)
-                where_clause = f'"{col}" {op} {val}'
-            except ValueError:
-                where_clause = f'"{col}" {op} \'{val_str}\''
-        else:
-            # No operator, assume exact match
-            where_clause = f'"{col}" = \'{criteria_val_raw}\''
-
-        result = self.conn.execute(
-            f'SELECT COUNT(*) FROM {sheet_name} WHERE {where_clause}'
-        ).fetchone()[0]
-
-        return float(result)
-
-    def _evaluate_scalar(self, formula: str, row_ctx: Dict[str, float]) -> Union[float, str]:
-        """
-        Phase 2: Evaluate scalar expression using numexpr for performance and security.
-        Handles IF, arithmetic operations, VLOOKUP, and cell references.
-
-        Returns either a numeric value or a string (for VLOOKUP results).
-        """
-        # Remove leading = if present
-        expr = formula.lstrip('=').strip()
-
-        # Convert Excel's <> to Python's != before other processing
-        expr = expr.replace('<>', '!=')
-
-        # Substitute cell references with values from row_ctx
-        for ref, value in row_ctx.items():
-            # Match whole cell references like D1, not partial matches
-            # Quote string values to preserve them in the expression
-            if isinstance(value, str):
-                replacement = f'"{value}"'
-            else:
-                replacement = str(value)
-            expr = re.sub(rf'\b{re.escape(ref)}\b', replacement, expr)
-
-        # Convert Excel's = to Python's == for equality comparisons
-        # Only convert if not already ==, and avoid converting in function calls
-        expr = re.sub(r'(?<=[\w"\'])=(?!=)', '==', expr)
-
-        # Handle VLOOKUP: VLOOKUP(lookup_value, table_array, col_index, range_lookup)
-        # Check if formula is just a VLOOKUP (standalone, not part of larger expression)
-        if re.match(r'^VLOOKUP\(', expr):
-            expr, vlookup_result = self._process_vlookup(expr)
-            if vlookup_result is not None:
-                return vlookup_result
-        else:
-            # VLOOKUP is part of larger expression - process it
-            expr, vlookup_result = self._process_vlookup(expr)
-
-        # Check if this is an IF statement that returns strings (can't use numexpr)
-        if self._has_string_if_result(expr):
-            return self._evaluate_string_if(expr)
-
-        # Handle IF statements: IF(condition, true_value, false_value)
-        # This converts to Python ternary: (true_val if condition else false_val)
-        expr = self._process_if_statements(expr)
-
-        # Convert Python ternary to numexpr where clause format
-        # Python: (true_val if condition else false_val)
-        # numexpr: where(condition, true_val, false_val)
-        expr = self._convert_to_numexpr(expr)
-
-        # Evaluate the expression using numexpr (faster and safer than eval)
-        try:
-            result = numexpr.evaluate(expr, local_dict={})
-            # numexpr returns a numpy array, extract scalar value
-            if hasattr(result, 'item'):
-                return float(result.item())
-            return float(result)
-        except Exception as e:
-            raise ValueError(f"Failed to evaluate expression '{expr}': {e}")
-
-    def _has_string_if_result(self, expr: str) -> bool:
-        """Check if the expression contains IF statements with string results."""
-        # Look for IF statements with quoted string values
-        if_pattern = r'IF\(([^,]+),([^,]+),([^)]+)\)'
-        matches = re.findall(if_pattern, expr)
-        for condition, true_val, false_val in matches:
-            # Check if either branch is a quoted string
-            if ('"' in true_val or '"' in false_val or "'" in true_val or "'" in false_val):
-                return True
-        return False
-
-    def _evaluate_string_if(self, expr: str) -> Union[float, str]:
-        """Evaluate IF statements with string results using Python eval."""
-        # Remove outer quotes for eval, but keep inner string quotes
-        expr = expr.strip()
-
-        # Process IF statements
-        if_pattern = r'IF\(([^,]+),([^,]+),([^)]+)\)'
-
-        def replace_if(m):
-            condition = m.group(1).strip()
-            true_val = m.group(2).strip()
-            false_val = m.group(3).strip()
-
-            # Recursively process nested IFs
-            condition = self._evaluate_string_if(condition) if 'IF(' in condition else condition
-            true_val = self._evaluate_string_if(true_val) if 'IF(' in true_val else true_val
-            false_val = self._evaluate_string_if(false_val) if 'IF(' in false_val else false_val
-
-            # Build Python eval expression
-            # Remove quotes from string values for eval, keep them for strings
-            def clean_val(v):
-                v = v.strip()
-                if (v.startswith('"') and v.endswith('"')) or (v.startswith("'") and v.endswith("'")):
-                    return v  # Keep quotes for strings
-                return v  # Return numbers/expressions as-is
-
-            true_val = clean_val(true_val)
-            false_val = clean_val(false_val)
-
-            return f"({true_val} if {condition} else {false_val})"
-
-        # Iteratively replace IF statements (from innermost first)
-        max_iterations = 10
-        for _ in range(max_iterations):
-            prev = expr
-            expr = re.sub(if_pattern, replace_if, expr)
-            if expr == prev:
-                break
-
-        # Evaluate using Python's eval (safe here since we control the input)
-        try:
-            result = eval(expr, {"__builtins__": {}}, {})
+            result = {}
+            for table_name, formulas in self.stored_formulas.items():
+                sheet_name_clean = table_name.replace('_', ' ').title()
+                result[sheet_name_clean] = formulas
             return result
-        except Exception as e:
-            raise ValueError(f"Failed to evaluate string IF expression '{expr}': {e}")
-
-    def _process_if_statements(self, expr: str) -> str:
-        """Process nested IF statements. Only for numeric results."""
-        # Pattern: IF(condition, true_val, false_val)
-        if_pattern = r'IF\(([^,]+),([^,]+),([^)]+)\)'
-
-        def replace_if(m):
-            condition = m.group(1).strip()
-            true_val = m.group(2).strip()
-            false_val = m.group(3).strip()
-
-            # Recursively process nested IFs
-            condition = self._process_if_statements(condition)
-            true_val = self._process_if_statements(true_val)
-            false_val = self._process_if_statements(false_val)
-
-            # Return Python ternary expression
-            return f"({true_val} if {condition} else {false_val})"
-
-        # Process from innermost to outermost (reverse the matches)
-        max_iterations = 10
-        for _ in range(max_iterations):
-            prev = expr
-            # Find innermost IF first by using non-greedy matching
-            matches = list(re.finditer(r'IF\(([^(),]+(?:\([^()]*\))?[^(),]*),([^(),]+(?:\([^()]*\))?[^(),]*),([^()]+(?:\([^()]*\))?[^()]*)\)', expr))
-            if not matches:
-                break
-            # Process from end (innermost) to start
-            for m in reversed(matches):
-                original = m.group(0)
-                replacement = replace_if(m)
-                expr = expr.replace(original, replacement, 1)
-                break  # Process one replacement, then re-scan
-
-        return expr
-
-    def _process_vlookup(self, expr: str) -> tuple:
-        """Process VLOOKUP function. Returns (new_expr, vlookup_result)."""
-        # Pattern: VLOOKUP(lookup_value, Sheet2!A:B, col_index, range_lookup)
-        vlookup_pattern = r'VLOOKUP\(([^,]+),([A-Za-z0-9_]+)!([A-Z]+):([A-Z]+),(\d+),([01]+)\)'
-        vlookup_result = None
-
-        def replace_vlookup(m):
-            nonlocal vlookup_result
-            lookup_val = m.group(1).strip().strip('"\'')  # Remove quotes
-            sheet = m.group(2).lower().replace(' ', '_')
-            start_col = m.group(3)
-            end_col = m.group(4)
-            col_offset = int(m.group(5)) - 1  # 1-based to 0-based
-            range_lookup = m.group(6) == '1'
-
-            # Get the source sheet data
-            df = self.sheets_data.get(sheet)
-            if df is None:
-                vlookup_result = 0
-                return "0"
-
-            # Find the lookup column (first column in the range)
-            lookup_col_letter = start_col
-            lookup_col_idx = ord(lookup_col_letter.upper()) - ord('A')
-
-            if lookup_col_idx >= len(df.columns):
-                vlookup_result = 0
-                return "0"
-
-            lookup_col_name = df.columns[lookup_col_idx]
-
-            # Find the return column
-            return_col_idx = lookup_col_idx + col_offset
-            if return_col_idx >= len(df.columns):
-                vlookup_result = 0
-                return "0"
-
-            return_col_name = df.columns[return_col_idx]
-
-            # Perform the lookup
-            try:
-                # Try to convert lookup_val to number for numeric comparison
-                try:
-                    numeric_lookup = float(lookup_val)
-                    lookup_series = df[lookup_col_name].astype(float)
-
-                    if range_lookup:
-                        # Approximate match: find largest value <= lookup_val
-                        # Filter to values <= lookup_val, then take max
-                        valid_values = lookup_series[lookup_series <= numeric_lookup]
-                        if len(valid_values) > 0:
-                            idx = valid_values.idxmax()
-                            result = df.loc[[idx]]
-                        else:
-                            result = pd.DataFrame()
-                    else:
-                        # Exact match
-                        result = df[lookup_series == numeric_lookup]
-                except ValueError:
-                    # String comparison
-                    if range_lookup:
-                        # Approximate match (not well-defined for strings, use exact)
-                        result = df[df[lookup_col_name].astype(str) == lookup_val]
-                    else:
-                        # Exact match
-                        result = df[df[lookup_col_name].astype(str) == lookup_val]
-
-                if len(result) > 0 and return_col_name in result.columns:
-                    val = result[return_col_name].iloc[0]
-                    vlookup_result = val  # Store for return
-                    # Return the actual value
-                    return str(val)
-                vlookup_result = 0
-                return "0"
-            except Exception:
-                vlookup_result = 0
-                return "0"
-
-        new_expr = re.sub(vlookup_pattern, replace_vlookup, expr)
-        return (new_expr, vlookup_result)
-
-    def _convert_to_numexpr(self, expr: str) -> str:
-        """Convert Python ternary expression to numexpr format.
-
-        Python ternary: (true_val if condition else false_val)
-        numexpr format: where(condition, true_val, false_val)
-        """
-        # Process from innermost to outermost
-        max_iterations = 10
-        for _ in range(max_iterations):
-            prev = expr
-            # Find innermost ternary: (value_if_true if condition else value_if_false)
-            inner_pattern = r'\(([^():]+)\s+if\s+([^():]+)\s+else\s+([^():]+)\)'
-
-            def convert_match(m):
-                true_val = m.group(1).strip()
-                condition = m.group(2).strip()
-                false_val = m.group(3).strip()
-                return f'where({condition}, {true_val}, {false_val})'
-
-            expr = re.sub(inner_pattern, convert_match, expr)
-            if expr == prev:
-                break
-
-        return expr

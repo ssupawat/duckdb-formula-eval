@@ -527,6 +527,29 @@ TEST_CASES = [
 ]
 
 
+def test_sql_conversion(formula: str, expected_sql_pattern: str, evaluator: FormulaEvaluator) -> bool:
+    """
+    Test that Excel formula converts to expected SQL pattern.
+
+    Args:
+        formula: Excel formula to test
+        expected_sql_pattern: Expected SQL pattern (can be partial)
+        evaluator: FormulaEvaluator instance
+
+    Returns:
+        True if generated SQL matches expected pattern
+    """
+    from formula_evaluator import FormulaEvaluator as FE
+    # Access the excel_to_sql method
+    sql = evaluator.excel_to_sql(formula, 'sheet1', {})
+    matches = expected_sql_pattern in sql
+    print(f"  Formula: {formula}")
+    print(f"  SQL: {sql}")
+    print(f"  Expected pattern: {expected_sql_pattern}")
+    print(f"  Match: {matches}")
+    return matches
+
+
 def create_test_excel() -> Path:
     """Create a test Excel file with sample data for testing."""
     wb = openpyxl.Workbook()
@@ -622,6 +645,10 @@ def run_test(test_case: Dict[str, Any], evaluator: FormulaEvaluator) -> bool:
     try:
         # Act: Execute the formula
         result = evaluator.evaluate_formula(formula, 'sheet1', row_ctx)
+
+        # Debug: Show generated SQL if available
+        if hasattr(evaluator, 'last_sql'):
+            print(f"     SQL: {evaluator.last_sql}")
 
         # If we expected an error but got a result, it's a failure
         if expected_error:

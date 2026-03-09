@@ -1,21 +1,21 @@
-# DuckDB Excel Formula Evaluator
+# DuckDB Excel Formula Evaluator (POC)
 
-A Excel formula evaluator using DuckDB for SQL-based evaluation.
+A simple Excel formula evaluator using pure DuckDB SQL for multi-step pipeline integration.
 
 ## Features
 
-- **Pure aggregates**: `SUM`, `AVERAGE`, `MAX`, `MIN`, `COUNTIF`, `SUMIF`
+- **Pure aggregates**: `SUM`, `AVERAGE`, `MAX`, `MIN`, `COUNT`, `COUNTIF`, `SUMIF`
 - **Scalar arithmetic**: Basic math operations on cell references
 - **IF statements**: Conditional formulas with nested conditions
 - **Nested formulas**: Aggregates inside IF statements, IF with aggregate conditions
 - **Cross-sheet VLOOKUP**: Lookup values across different sheets
 - **Vectorized SQL evaluation**: 10-100x faster for simple arithmetic formulas
-- **Hybrid evaluation**: SQL for aggregates + numexpr for scalar expressions
+- **Pure SQL architecture**: All evaluation happens within DuckDB, no external dependencies
 
 ## Installation
 
 ```bash
-pip install duckdb openpyxl pandas numexpr
+pip install duckdb openpyxl pandas
 ```
 
 Or using requirements.txt:
@@ -50,7 +50,7 @@ for sheet_name in excel_file.sheet_names:
 # Create evaluator
 evaluator = FormulaEvaluator(conn, sheets_data)
 
-# Evaluate formulas
+# Evaluate formula
 result = evaluator.evaluate_formula('=SUM(D:D)', 'sheet1')
 print(result)  # 825.0
 
@@ -59,27 +59,17 @@ result = evaluator.evaluate_formula('=IF(D1>80, D1*1.1, D1*0.9)', 'sheet1', {'D1
 print(result)  # 110.0
 ```
 
-### Running Tests
+### Multi-Step Pipeline Integration
 
-```bash
-# Run all 48 test cases
-python3 test_formula_evaluator.py
-```
+```python
+# Step 1: Apply formula to DuckDB table
+evaluator.apply_formula_to_column('=B2*1.1', 'sheet1', 'bonus', context_column='quantity')
 
-### Generating Test Files
+# Step 2: Data changes (from another step in the pipeline)
+conn.execute("UPDATE sheet1 SET quantity = quantity * 2")
 
-```bash
-# Generate simple 10K test file
-python3 generate_test_files.py 10000
-
-# Generate all simple test files
-python3 generate_test_files.py
-
-# Generate complex 10K test file
-python3 generate_test_files.py --complex 10000
-
-# Generate all complex test files
-python3 generate_test_files.py --complex
+# Step 3: Recalculate formulas
+evaluator.recalculate_all('sheet1')
 ```
 
 ## Supported Formula Types
@@ -90,6 +80,7 @@ python3 generate_test_files.py --complex
 =AVERAGE(D:D)
 =MAX(D:D)
 =MIN(D:D)
+=COUNT(D:D)
 =COUNTIF(C:C,"x")
 =SUMIF(C:C,"x",D:D)
 ```
@@ -122,149 +113,77 @@ python3 generate_test_files.py --complex
 =VLOOKUP(A1,Sheet2!A:B,2,0)
 ```
 
-## Core Concepts
+## API Reference
 
-The DuckDB Formula Demo implements three core concepts for high-performance formula evaluation:
+### `evaluate_formula(formula, sheet_name, row_ctx=None)`
+Evaluate an Excel formula.
 
-### 1. Pattern Detection
+**Parameters:**
+- `formula` - Excel formula (e.g., "=SUM(D:D)")
+- `sheet_name` - Name of the sheet
+- `row_ctx` - Optional row context for cell references (e.g., {"D1": 100.0})
 
-**Where:** `formula_evaluator.py:37-80` → `_parse_formula_pattern()`
+**Returns:** Formula result as float or string
 
-**Purpose:** Classify formula to determine evaluation strategy
+### `apply_formula_to_column(formula, sheet_name, target_column, context_column=None)`
+Apply a formula to all rows in a target column.
 
-**Input → Output Examples:**
+**Parameters:**
+- `formula` - Excel formula
+- `sheet_name` - Name of the sheet
+- `target_column` - Name of column to store results
+- `context_column` - Optional column for row context
 
-| Input Formula | Detected Pattern | Type | Next Step |
-|--------------|------------------|------|-----------|
-| `=A2+B2` | `A + B` | simple | Vectorized SQL |
-| `=A2*2` | `A * 2` | scalar | Vectorized SQL |
-| `=Sheet1!A2` | source=Sheet1, col=A | cross_sheet | Vectorized SQL |
-| `=SUM(D:D)` | (no match) | complex | Two-Phase |
-| `=IF(D1>80, D1*1.1, D1)` | (no match) | complex | Two-Phase |
-
-**Key Regex Patterns:**
+**Example:**
 ```python
-r'^([A-Z])\d+\s*([+\-*/])\s*([A-Z])\d+$'  # A2+B2
-r'^([A-Z])\d+\s*([+\-*/])\s*(\d+(?:\.\d+)?)$'  # A2*2
-r'^([A-Za-z0-9_]+)!([A-Z])\d+$'  # Sheet1!A2
+evaluator.apply_formula_to_column('=B2*0.1', 'sheet1', 'bonus', context_column='quantity')
 ```
 
----
+### `recalculate_all(sheet_name=None)`
+Recalculate all formulas for a sheet.
 
-### 2. Vectorized SQL Evaluation
+**Parameters:**
+- `sheet_name` - Name of the sheet (if None, recalculate all sheets)
 
-**Where:** `formula_evaluator.py:82-131` → `_evaluate_vectorized()`
+### `store_formula_at_cell(formula, sheet_name, row, col)`
+Store a formula at a specific cell location.
 
-**Purpose:** Evaluate simple formulas on entire columns using single SQL query
+**Parameters:**
+- `formula` - Excel formula
+- `sheet_name` - Name of the sheet
+- `row` - Row number (1-indexed)
+- `col` - Column letter (e.g., "A", "D")
 
-**Input → Processing → Output:**
-
-**Input:**
-- Formula: `=A2+B2`
-- Sheet data (5 rows × 3 columns):
-```
-     A    B    C
-1   10   20   30
-2   15   25   35
-3   20   30   40
-4   25   35   45
-5   30   40   50
-```
-
-**Processing:**
+**Example:**
 ```python
-# 1. Build column map
-col_map = {'A': 'col0', 'B': 'col1', 'C': 'col2'}
-
-# 2. Parse pattern: "A + B"
-# 3. Generate SQL
-sql = 'SELECT "col0" + "col1" FROM sheet1'
-
-# 4. Execute
-result = conn.execute(sql).fetchdf()
+evaluator.store_formula_at_cell('=SUM(A:A)', 'sheet1', row=1, col='F')
 ```
 
-**Output:** `pd.Series([30, 40, 50, 60, 70])`
+## Running Tests
 
-**Performance:** 10K rows in ~0.014s (vs ~17s per-cell)
-
----
-
-### 3. Two-Phase Decomposition
-
-**Where:** `formula_evaluator.py:150-364`
-- Phase 1: `_resolve_aggregates()` (lines 150-181)
-- Phase 2: `_evaluate_scalar()` (lines 306-364)
-
-**Purpose:** Handle complex formulas with aggregates, IF, VLOOKUP
-
-**Input → Processing → Output:**
-
-**Input:**
-- Formula: `=IF(SUM(D:D)>100, D1*1.1, D1*0.9)`
-- Sheet data: Column D = [100, 200, 150, 75, 300]
-- Row context: `{"D1": 100.0}`
-
-**Phase 1: Resolve Aggregates**
+```bash
+# Run all 40 test cases
+python3 test_formula_evaluator.py
 ```
-Input:  =IF(SUM(D:D)>100, D1*1.1, D1*0.9)
-        ↓
-SQL:    SELECT COALESCE(SUM("col3"), 0) FROM sheet1
-        ↓
-Result: 825.0
-        ↓
-Output: =IF(825.0>100, D1*1.1, D1*0.9)
-```
-
-**Phase 2: Evaluate Scalar**
-```
-Input:  =IF(825.0>100, D1*1.1, D1*0.9)
-        ↓
-Substitute D1=100: =IF(825.0>100, 100*1.1, 100*0.9)
-        ↓
-Evaluate condition (825.0>100 = TRUE): 100*1.1
-        ↓
-numexpr: where(825.0>100, 100*1.1, 100*0.9)
-        ↓
-Output: 110.0
-```
-
-**Why Two Phases?**
-- Aggregates need SQL (operate on entire columns)
-- Cell references need scalar values (from row_ctx)
-- Separation allows each phase to use optimal tool
 
 ## Implementation Details
 
-### Vectorized SQL Evaluation
+### Excel to SQL Conversion Pipeline
 
-The evaluator includes a **pattern detection + vectorized evaluation** optimization for simple formulas:
+**Conversion Order (Critical):**
+1. VLOOKUP → SQL subqueries
+2. Aggregates → SQL subqueries
+3. IF → CASE expressions
+4. Cell references → scalar values
+5. Operators → SQL operators
 
-| Pattern Type | Example | Detection | Evaluation Method |
-|-------------|---------|-----------|-------------------|
-| Simple arithmetic | `=A2+B2`, `=D2*E2` | Two-column arithmetic | SQL on entire column |
-| Scalar operation | `=A2*2`, `=B2/10` | Column + constant | SQL on entire column |
-| Cross-sheet | `=Sheet1!A2` | Sheet reference | SQL from other sheet |
-| Complex | `=SUM(D:D)`, `IF(...)` | Aggregates/IF/VLOOKUP | Two-phase (aggregate + numexpr) |
+**Input → Output Examples:**
 
-**Performance comparison for 10K rows:**
-- Original (per-cell): ~17 seconds
-- Optimized (vectorized): ~0.014 seconds
-- **Speedup: 1200x**
-
-The optimization is transparent - existing code using `evaluate_formula()` continues to work without changes.
-
-### Two-Phase Formula Evaluation
-
-For complex formulas (aggregates, IF statements, VLOOKUP), the evaluator uses a two-phase approach:
-
-1. **Phase 1 (DuckDB SQL)**: Extract and compute all aggregate functions
-2. **Phase 2 (numexpr)**: Substitute aggregates and evaluate scalar expressions safely
-
-Using **numexpr** instead of Python's `eval()` provides:
-- **2-10x faster** scalar expression evaluation (C-optimized)
-- **Security**: No arbitrary code execution risk
-- **Compatibility**: Works with numpy arrays and Python variables
+| Input Formula | Generated SQL |
+|--------------|---------------|
+| `=IF(D1>80, D1*1.1, D1*0.9)` | `SELECT CASE WHEN 100.0 > 80 THEN 100.0 * 1.1 ELSE 100.0 * 0.9 END` |
+| `=SUM(D:D)` | `SELECT (SELECT COALESCE(SUM("amount"), 0) FROM sheet1)` |
+| `=VLOOKUP("A",Sheet2!A:B,2,0)` | `SELECT (SELECT COALESCE((SELECT label FROM sheet2 WHERE key = 'A' LIMIT 1), NULL))` |
 
 ## Project Structure
 
@@ -274,12 +193,7 @@ duckdb-formula-demo/
 ├── README.md
 ├── requirements.txt
 ├── formula_evaluator.py        # Library: FormulaEvaluator class
-│   ├── evaluate_formula()      # Main entry point (auto-detects vectorized vs two-phase)
-│   ├── _parse_formula_pattern() # Detects simple patterns for vectorized evaluation
-│   ├── _evaluate_vectorized()   # Vectorized SQL evaluation for simple formulas
-│   ├── _resolve_aggregates()    # Phase 1: Compute aggregates via SQL
-│   └── _evaluate_scalar()       # Phase 2: Evaluate scalar expressions via numexpr
-├── test_formula_evaluator.py   # Tests: 48 comprehensive test cases
+├── test_formula_evaluator.py   # Tests: 40 comprehensive test cases
 ├── generate_test_files.py      # Test data generator
 └── test_files/
     ├── simple_10k.xlsx         # Simple formula test file
