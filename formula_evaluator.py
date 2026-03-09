@@ -21,23 +21,39 @@ from typing import Any, Dict, List, Tuple, Optional, Union
 
 
 class FormulaEvaluator:
-    """Evaluate Excel formulas using pure DuckDB SQL approach (POC)."""
+    """
+    Evaluate Excel formulas using pure DuckDB SQL.
 
-    def __init__(self, conn: duckdb.DuckDBPyConnection, sheets_data: Dict[str, pd.DataFrame]):
+    This evaluator expects data to already exist in DuckDB tables.
+    Formula results are written directly to DuckDB tables - no DataFrames needed.
+
+    Supported formula types:
+    - Pure aggregates: SUM, AVERAGE, MAX, MIN, COUNTIF, SUMIF
+    - Scalar arithmetic: Basic math operations on cell references
+    - IF statements: Conditional formulas with nested conditions
+    - Nested formulas: Aggregates inside IF statements, IF with aggregate conditions
+    - Arithmetic on aggregates: SUM(D:D)*0.1
+    - Cross-sheet VLOOKUP
+    """
+
+    def __init__(self, conn: duckdb.DuckDBPyConnection):
         """
         Initialize the evaluator.
 
         Args:
-            conn: DuckDB connection with registered tables
-            sheets_data: Dictionary mapping sheet names to pandas DataFrames
+            conn: DuckDB connection with tables already registered
+                  (Data loading is handled separately, not by the evaluator)
         """
         self.conn = conn
-        self.sheets_data = sheets_data
         self.last_sql = None  # Store last generated SQL for debugging
 
-        # Formula storage for recalculation
-        # Structure: {sheet_name: {formula_id: {"formula": "...", "target_column": "...", ...}}}
-        self.stored_formulas: Dict[str, Dict[str, Dict[str, Any]]] = {}
+        # Cache column names from DuckDB information_schema
+        # Structure: {table_name: [col_name1, col_name2, ...]}
+        self._column_cache: Dict[str, List[str]] = {}
+
+        # Formula metadata storage for recalculation
+        # Structure: {table_name: {target_column: formula}}
+        self.formulas: Dict[str, Dict[str, str]] = {}
 
     # ========================================================================
     # PURE SQL CONVERSION METHODS
@@ -176,9 +192,11 @@ class FormulaEvaluator:
     def _convert_aggregates_to_sql(self, formula: str, sheet_name: str) -> str:
         """Convert Excel aggregate functions to SQL subqueries."""
         table_name = sheet_name.lower().replace(' ', '_')
-        df = self.sheets_data.get(table_name)
-        if df is None:
-            return formula
+        # Check if table exists in DuckDB
+        try:
+            self.conn.execute(f'SELECT 1 FROM {table_name} LIMIT 1')
+        except Exception:
+            return formula  # Table doesn't exist, return formula unchanged
 
         # Handle COUNT(D:D) pattern
         formula = re.sub(
@@ -303,8 +321,15 @@ class FormulaEvaluator:
             target_table = target_sheet.lower().replace(' ', '_')
 
             # Check if target table exists
-            if target_table not in self.sheets_data:
+            try:
+                self.conn.execute(f'SELECT 1 FROM {target_table} LIMIT 1')
+            except Exception:
                 return '0'
+
+            # Ensure index exists on lookup column (optimization for VLOOKUP)
+            lookup_col = self._get_column_name(col_start, target_table)
+            if lookup_col:
+                self._ensure_index(target_table, lookup_col)
 
             # Get column names
             lookup_col = self._get_column_name(col_start, target_table)
@@ -333,6 +358,23 @@ class FormulaEvaluator:
             return sql
 
         return re.sub(pattern, replace_vlookup, formula)
+
+    def _ensure_index(self, table_name: str, column_name: str) -> None:
+        """
+        Ensure an index exists on a column for faster VLOOKUP.
+
+        This is a simple optimization that turns O(n) lookups into O(log n).
+        """
+        index_name = f'idx_{table_name}_{column_name}'
+        try:
+            # Check if index exists
+            self.conn.execute(f"SELECT * FROM information_schema.indexes WHERE index_name = '{index_name}'")
+        except Exception:
+            # Create index if it doesn't exist
+            try:
+                self.conn.execute(f'CREATE INDEX {index_name} ON {table_name}("{column_name}")')
+            except Exception:
+                pass  # Index creation might fail for various reasons
 
     def _substitute_cell_references(self, formula: str, row_ctx: Dict[str, float]) -> str:
         """Substitute cell references with scalar values from row context."""
@@ -453,14 +495,50 @@ class FormulaEvaluator:
         if match:
             return {'type': 'cross_sheet', 'sheet': match.group(1), 'col': match.group(2)}
 
+        # === NEW: Pattern for IF statements with column references ===
+        # IF(D2>100, D2*1.1, D2) or IF(A2>B2, A2, B2)
+        # Pattern: IF(COL1 OP VALUE, COL2 OP2 VALUE2, COL3)
+        # where OP is comparison operator, OP2 is arithmetic operator
+        match = re.match(
+            r'^IF\(([A-Z])\d+([><=!]+)([\d.]+),\s*([A-Z])\d+([+\-*/])([\d.]+),\s*([A-Z])\d+\)$',
+            formula_clean
+        )
+        if match:
+            return {
+                'type': 'if',
+                'col1': match.group(1),           # Condition column
+                'op': match.group(2),             # Comparison operator
+                'val': match.group(3),            # Comparison value
+                'result_col': match.group(4),     # True result column
+                'result_op': match.group(5),      # True result operator
+                'result_val': match.group(6),     # True result value
+                'else_col': match.group(7)        # False result column
+            }
+
+        # Also handle IF with column-column comparison: IF(A2>B2, A2, B2)
+        match = re.match(
+            r'^IF\(([A-Z])\d+([><=!]+)([A-Z])\d+,\s*([A-Z])\d+,\s*([A-Z])\d+\)$',
+            formula_clean
+        )
+        if match:
+            return {
+                'type': 'if',
+                'col1': match.group(1),           # Condition column 1
+                'op': match.group(2),             # Comparison operator
+                'col2': match.group(3),           # Condition column 2
+                'result_col': match.group(4),     # True result column
+                'else_col': match.group(5)        # False result column
+            }
+
         return {'type': 'complex'}
 
     def _evaluate_vectorized(self, formula: str, sheet_name: str, pattern: Dict[str, Any]) -> pd.Series:
-        """Evaluate simple formulas on entire column using vectorized SQL."""
+        """
+        Evaluate simple formulas on entire column using vectorized SQL.
+
+        Returns results as pandas Series for compatibility with existing code.
+        """
         table_name = sheet_name.lower().replace(' ', '_')
-        df = self.sheets_data.get(table_name)
-        if df is None:
-            raise ValueError(f"Sheet '{sheet_name}' not found")
 
         if pattern['type'] == 'simple':
             col1 = self._get_column_name(pattern['col1'], table_name)
@@ -475,17 +553,75 @@ class FormulaEvaluator:
                 sql = f'SELECT "{col}" {pattern["op"]} {pattern["value"]} FROM {table_name}'
                 return self.conn.execute(sql).fetchdf().iloc[:, 0]
 
+        elif pattern['type'] == 'cross_sheet':
+            target_table = pattern['sheet'].lower().replace(' ', '_')
+            # Check if table exists in DuckDB
+            try:
+                self.conn.execute(f'SELECT 1 FROM {target_table} LIMIT 1')
+                col = self._get_column_name(pattern['col'], target_table)
+                if col:
+                    sql = f'SELECT "{col}" FROM {target_table}'
+                    return self.conn.execute(sql).fetchdf().iloc[:, 0]
+            except Exception:
+                pass  # Table doesn't exist
+
+        # === Handle IF statements ===
+        elif pattern['type'] == 'if':
+            # Pattern: IF(D2>100, D2*1.1, D2) - scalar comparison
+            if 'val' in pattern and 'result_val' in pattern:
+                col1 = self._get_column_name(pattern['col1'], table_name)
+                col_result = self._get_column_name(pattern['result_col'], table_name)
+                col_else = self._get_column_name(pattern['else_col'], table_name)
+                if col1 and col_result and col_else:
+                    sql = (f'SELECT CASE WHEN "{col1}" {pattern["op"]} {pattern["val"]} '
+                           f'THEN "{col_result}" {pattern["result_op"]} {pattern["result_val"]} '
+                           f'ELSE "{col_else}" END FROM {table_name}')
+                    return self.conn.execute(sql).fetchdf().iloc[:, 0]
+
+            # Pattern: IF(A2>B2, A2, B2) - column-column comparison
+            elif 'col2' in pattern:
+                col1 = self._get_column_name(pattern['col1'], table_name)
+                col2 = self._get_column_name(pattern['col2'], table_name)
+                col_result = self._get_column_name(pattern['result_col'], table_name)
+                col_else = self._get_column_name(pattern['else_col'], table_name)
+                if col1 and col2 and col_result and col_else:
+                    sql = (f'SELECT CASE WHEN "{col1}" {pattern["op"]} "{col2}" '
+                           f'THEN "{col_result}" ELSE "{col_else}" END FROM {table_name}')
+                    return self.conn.execute(sql).fetchdf().iloc[:, 0]
+
         raise ValueError(f"Unsupported pattern: {pattern}")
 
-    def _get_column_name(self, col_letter: str, sheet_name: str) -> Optional[str]:
-        """Map Excel column letter to actual column name."""
-        df = self.sheets_data.get(sheet_name)
-        if df is None:
-            return None
+    def _get_column_name(self, col_letter: str, table_name: str) -> Optional[str]:
+        """
+        Map Excel column letter to actual column name using DuckDB information_schema.
 
+        Args:
+            col_letter: Excel column letter (e.g., 'A', 'B', 'C')
+            table_name: DuckDB table name
+
+        Returns:
+            Actual column name or None if not found
+        """
+        # Check cache first
+        if table_name not in self._column_cache:
+            try:
+                # Query DuckDB's information_schema for column names
+                result = self.conn.execute(f"""
+                    SELECT column_name
+                    FROM information_schema.columns
+                    WHERE table_name = '{table_name.lower()}'
+                    ORDER BY ordinal_position
+                """).fetchall()
+                self._column_cache[table_name] = [row[0] for row in result]
+            except Exception:
+                # Table doesn't exist or error
+                self._column_cache[table_name] = []
+
+        columns = self._column_cache[table_name]
         col_idx = ord(col_letter.upper()) - ord('A')
-        if 0 <= col_idx < len(df.columns):
-            return df.columns[col_idx]
+
+        if 0 <= col_idx < len(columns):
+            return columns[col_idx]
         return None
 
     # ========================================================================
@@ -528,178 +664,122 @@ class FormulaEvaluator:
     # ========================================================================
     # PERSISTENCE METHODS (POC - simplified)
     # ========================================================================
+    # PUBLIC API: APPLY FORMULA TO COLUMN (SQL EXECUTION ONLY)
+    # ========================================================================
 
     def apply_formula_to_column(
         self,
         formula: str,
         sheet_name: str,
-        target_column: str,
-        context_column: str = None,
-        store_formula: bool = True
+        target_column: str
     ) -> None:
         """
-        Apply a formula to all rows in a target column.
+        Apply formula to column by executing SQL in DuckDB.
 
-        This evaluates the formula for each row and stores the results in the target column.
-        If the target column doesn't exist, it will be created.
+        This converts Excel formula to SQL and executes UPDATE directly.
+        No evaluation happens in Python - everything runs in DuckDB.
 
         Args:
-            formula: Excel formula (e.g., "=D2*1.1", "=IF(D2>100, D2*1.1, D2)")
+            formula: Excel formula (e.g., "=A2+B2", "=IF(A2>100, A2*1.1, A2)")
             sheet_name: Name of the sheet
-            target_column: Name of column to store results (creates if doesn't exist)
-            context_column: Optional column to use for row context (e.g., "D" for D2 references)
+            target_column: Name of column to store results (must exist)
 
         Example:
-            # Create a new "bonus" column with 10% increase
-            evaluator.apply_formula_to_column('=D2*1.1', 'sheet1', 'bonus', context_column='amount')
+            evaluator = FormulaEvaluator(conn)
+            evaluator.apply_formula_to_column('=A2+B2', 'sheet1', 'c')
+            # Executes: UPDATE sheet1 SET "c" = "a" + "b"
+            # Results stay in DuckDB - no return value
         """
         table_name = sheet_name.lower().replace(' ', '_')
-        df = self.sheets_data.get(table_name)
-        if df is None:
-            raise ValueError(f"Sheet '{sheet_name}' not found")
 
-        # Check if target column exists
-        if target_column not in df.columns:
-            df[target_column] = None
+        # Build SQL expression from formula
+        pattern = self._parse_formula_pattern(formula)
+        sql_expr = self._build_vectorized_sql_expression(formula, table_name, pattern)
 
-        # Evaluate formula for each row
-        results = []
-        for idx, row in df.iterrows():
-            # Build row context from context_column if specified
-            row_ctx = {}
-            if context_column and context_column in df.columns:
-                # Map context column to Excel cell reference
-                col_idx = df.columns.get_loc(context_column)
-                col_letter = chr(ord('A') + col_idx)
-                cell_ref = f"{col_letter}{idx + 2}"
-                row_ctx[cell_ref] = row[context_column]
+        # Execute UPDATE directly in DuckDB
+        sql = f'UPDATE {table_name} SET "{target_column}" = {sql_expr}'
+        self.conn.execute(sql)
 
-            # Evaluate formula for this row
-            try:
-                result = self.evaluate_formula(formula, sheet_name, row_ctx)
-                results.append(result)
-            except Exception as e:
-                results.append(None)
+        # Store formula metadata for recalculation
+        if table_name not in self.formulas:
+            self.formulas[table_name] = {}
+        self.formulas[table_name][target_column] = formula
 
-        # Update DataFrame with results
-        df[target_column] = results
+    def _build_vectorized_sql_expression(self, formula: str, table_name: str, pattern: Dict[str, Any]) -> str:
+        """Build SQL expression from Excel formula pattern."""
+        if pattern['type'] == 'simple':
+            col1 = self._get_column_name(pattern['col1'], table_name)
+            col2 = self._get_column_name(pattern['col2'], table_name)
+            if col1 and col2:
+                return f'"{col1}" {pattern["op"]} "{col2}"'
 
-        # Recreate table with new data
-        self._recreate_table_from_dataframe(sheet_name, df)
+        elif pattern['type'] == 'scalar':
+            col = self._get_column_name(pattern['col'], table_name)
+            if col:
+                return f'"{col}" {pattern["op"]} {pattern["value"]}'
 
-        # Store formula for recalculation
-        if store_formula:
-            formula_id = f"{target_column}_formula"
-            if table_name not in self.stored_formulas:
-                self.stored_formulas[table_name] = {}
-            self.stored_formulas[table_name][formula_id] = {
-                "formula": formula,
-                "target_column": target_column
-            }
+        elif pattern['type'] == 'cross_sheet':
+            target_table = pattern['sheet'].lower().replace(' ', '_')
+            col = self._get_column_name(pattern['col'], target_table)
+            if col:
+                return f'(SELECT "{col}" FROM {target_table})'
 
-    def _recreate_table_from_dataframe(self, sheet_name: str, df: pd.DataFrame) -> None:
-        """Recreate a DuckDB table from a DataFrame."""
-        table_name = sheet_name.lower().replace(' ', '_')
-        temp_table = f"{table_name}_new"
+        elif pattern['type'] == 'if':
+            # IF(D2>100, D2*1.1, D2)
+            if 'val' in pattern and 'result_val' in pattern:
+                col1 = self._get_column_name(pattern['col1'], table_name)
+                col_result = self._get_column_name(pattern['result_col'], table_name)
+                col_else = self._get_column_name(pattern['else_col'], table_name)
+                if col1 and col_result and col_else:
+                    return (f'CASE WHEN "{col1}" {pattern["op"]} {pattern["val"]} '
+                            f'THEN "{col_result}" {pattern["result_op"]} {pattern["result_val"]} '
+                            f'ELSE "{col_else}" END')
+            # IF(A2>B2, A2, B2)
+            elif 'col2' in pattern:
+                col1 = self._get_column_name(pattern['col1'], table_name)
+                col2 = self._get_column_name(pattern['col2'], table_name)
+                col_result = self._get_column_name(pattern['result_col'], table_name)
+                col_else = self._get_column_name(pattern['else_col'], table_name)
+                if col1 and col2 and col_result and col_else:
+                    return f'CASE WHEN "{col1}" {pattern["op"]} "{col2}" THEN "{col_result}" ELSE "{col_else}" END'
 
-        # Create new table with the DataFrame data
-        df.to_sql(
-            name=temp_table,
-            con=self.conn,
-            index=False,
-            if_exists='replace'
-        )
+        # For complex formulas, use full SQL conversion
+        return self.excel_to_sql(formula, table_name.replace('_', ' ').title()).replace('SELECT ', '')
 
-        # Drop old table and rename new one
-        self.conn.execute(f'DROP TABLE IF EXISTS {table_name}')
-        self.conn.execute(f'ALTER TABLE {temp_table} RENAME TO {table_name}')
+    # ========================================================================
+    # RECALCULATION
+    # ========================================================================
 
-        # Update the cached DataFrame
-        self.sheets_data[table_name] = df
-
-    def store_formula_at_cell(
-        self,
-        formula: str,
-        sheet_name: str,
-        row: int,
-        col: str
-    ) -> None:
+    def recalculate_all(self) -> None:
         """
-        Store a formula at a specific cell location (Excel-style).
-
-        Args:
-            formula: Excel formula (e.g., "=SUM(A:A)")
-            sheet_name: Name of the sheet
-            row: Row number (1-indexed, like Excel)
-            col: Column letter (e.g., "A", "D")
+        Recalculate all stored formulas.
 
         Example:
-            evaluator.store_formula_at_cell('=SUM(A:A)', 'sheet1', row=1, col='F')
+            evaluator.recalculate_all()  # Recalculate all sheets
         """
-        table_name = sheet_name.lower().replace(' ', '_')
-        cell_ref = f"{col}{row}"
-
-        if table_name not in self.stored_formulas:
-            self.stored_formulas[table_name] = {}
-
-        self.stored_formulas[table_name][cell_ref] = {
-            "formula": formula,
-            "row": row,
-            "col": col
-        }
-
-    # ========================================================================
-    # RECALCULATION (POC - simple recalculate all)
-    # ========================================================================
-
-    def recalculate_all(self, sheet_name: str = None) -> None:
-        """
-        Recalculate all formulas for a sheet.
-
-        Args:
-            sheet_name: Name of the sheet (if None, recalculate all sheets)
-        """
-        tables_to_recalc = []
-        if sheet_name:
-            table_name = sheet_name.lower().replace(' ', '_')
-            if table_name in self.stored_formulas:
-                tables_to_recalc.append(table_name)
-        else:
-            tables_to_recalc = list(self.stored_formulas.keys())
+        tables_to_recalc = list(self.formulas.keys())
 
         for table_name in tables_to_recalc:
-            formulas = self.stored_formulas.get(table_name, {})
-            sheet_name = table_name.replace('_', ' ').title()
+            formulas = self.formulas.get(table_name, {})
+            sheet_title = table_name.replace('_', ' ').title()
 
-            for formula_id, formula_data in formulas.items():
-                formula = formula_data["formula"]
-                target_column = formula_data.get("target_column")
+            for target_column, formula in formulas.items():
+                self.apply_formula_to_column(formula, sheet_title, target_column)
 
-                if target_column:
-                    # Column formula - reapply to entire column
-                    self.apply_formula_to_column(
-                        formula,
-                        sheet_name,
-                        target_column,
-                        store_formula=False  # Already stored
-                    )
-
-    def get_stored_formulas(self, sheet_name: str = None) -> Dict[str, Dict]:
+    def get_formulas(self) -> Dict[str, Dict[str, str]]:
         """
         Get all stored formulas.
 
-        Args:
-            sheet_name: Optional sheet name (if None, return all)
-
         Returns:
-            Dictionary of stored formulas
+            Dictionary of formulas: {sheet_name: {column: formula}}
+
+        Example:
+            formulas = evaluator.get_formulas()
+            # {'Sheet1': {'c': '=A2+B2', 'd': '=C2*2'}}
         """
-        if sheet_name:
-            table_name = sheet_name.lower().replace(' ', '_')
-            return {sheet_name: self.stored_formulas.get(table_name, {})}
-        else:
-            result = {}
-            for table_name, formulas in self.stored_formulas.items():
-                sheet_name_clean = table_name.replace('_', ' ').title()
-                result[sheet_name_clean] = formulas
-            return result
+        # Convert table names back to sheet names
+        result = {}
+        for table_name, formulas in self.formulas.items():
+            sheet_name_clean = table_name.replace('_', ' ').title()
+            result[sheet_name_clean] = formulas
+        return result

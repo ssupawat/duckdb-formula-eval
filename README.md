@@ -1,6 +1,6 @@
-# DuckDB Excel Formula Evaluator (POC)
+# DuckDB Excel Formula Evaluator
 
-A simple Excel formula evaluator using pure DuckDB SQL for multi-step pipeline integration.
+A lightweight Excel formula evaluator library using pure DuckDB SQL for multi-step pipeline integration.
 
 ## Features
 
@@ -188,14 +188,10 @@ python3 test_formula_evaluator.py
 ## Project Structure
 
 ```
-duckdb-formula-demo/
+duckdb-formula-eval/
 ├── .gitignore
 ├── README.md
 ├── requirements.txt
 ├── formula_evaluator.py        # Library: FormulaEvaluator class
-├── test_formula_evaluator.py   # Tests: 40 comprehensive test cases
-├── generate_test_files.py      # Test data generator
-└── test_files/
-    ├── simple_10k.xlsx         # Simple formula test file
-    └── complex_10k.xlsx        # Complex formula test file
+└── test_formula_evaluator.py   # Tests: 40 comprehensive test cases
 ```
