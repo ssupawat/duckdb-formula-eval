@@ -53,28 +53,31 @@ for sheet_name in excel_file.sheet_names:
 evaluator = FormulaEvaluator(conn)
 
 # Apply formula to column (executes in DuckDB)
-evaluator.apply_formula_to_column('=amount*1.1', 'sheet1', 'bonus')
+# Use Excel column syntax like D:D (column D) for column-wide operations
+evaluator.apply_formula_to_column('=D:D*1.1', 'sheet1', 'bonus')
 
 # Get results by querying DuckDB
 result = conn.execute("SELECT SUM(bonus) FROM sheet1").fetchone()[0]
 print(result)  # 825.0
 
 # For debugging: see the SQL that would be generated
-sql = evaluator.excel_to_sql('=SUM(amount)', 'sheet1')
-print(sql)  # SELECT (SELECT COALESCE(SUM("amount"), 0) FROM sheet1)
+sql = evaluator.excel_to_sql('=SUM(D:D)', 'sheet1')
+print(sql)  # SELECT (SELECT COALESCE(SUM("d"), 0) FROM sheet1)
 ```
+
+**Note:** The library maps Excel column letters (A, B, C, D...) to actual column names in your data. Column `D` in your Excel file maps to the 4th column in your data.
 
 ### Multi-Step Pipeline Integration
 
 ```python
-# Step 1: Apply formula to DuckDB table
-evaluator.apply_formula_to_column('=quantity*1.1', 'sheet1', 'bonus')
+# Step 1: Apply formula to DuckDB table (using Excel column syntax)
+evaluator.apply_formula_to_column('=D:D*1.1', 'sheet1', 'bonus')
 
 # Step 2: Query results from DuckDB
 total_bonus = conn.execute("SELECT SUM(bonus) FROM sheet1").fetchone()[0]
 
 # Step 3: Data changes (from another step in the pipeline)
-conn.execute("UPDATE sheet1 SET quantity = quantity * 2")
+conn.execute("UPDATE sheet1 SET d = d * 2")
 
 # Step 4: Recalculate formulas
 evaluator.recalculate_all()
@@ -96,15 +99,17 @@ total_bonus = conn.execute("SELECT SUM(bonus) FROM sheet1").fetchone()[0]
 =SUMIF(C:C,"x",D:D)
 ```
 
-### Scalar Arithmetic
+### Scalar Arithmetic (cell references)
 ```excel
-=D1*1.07
-=A1+B1+C1
+=D1*1.07      # Multiply cell D1 by 1.07
+=A1+B1+C1     # Add cells A1, B1, C1
+=D:D*1.1      # Multiply entire column D by 1.1 (column operation)
 ```
 
 ### IF Statements
 ```excel
-=IF(D1>80, D1*1.1, D1*0.9)
+=IF(D1>80, D1*1.1, D1*0.9)           # Cell reference
+=IF(D:D>80, D:D*1.1, D:D*0.9)        # Column operation (applies to all rows)
 ```
 
 ### Nested Formulas
@@ -130,13 +135,14 @@ total_bonus = conn.execute("SELECT SUM(bonus) FROM sheet1").fetchone()[0]
 Apply a formula to all rows in a target column.
 
 **Parameters:**
-- `formula` - Excel formula (use column references like "quantity" not "B2")
+- `formula` - Excel formula (use Excel syntax like `=D:D*1.1` for column D)
 - `sheet_name` - Name of the sheet
 - `target_column` - Name of column to store results
 
 **Example:**
 ```python
-evaluator.apply_formula_to_column('=quantity*0.1', 'sheet1', 'bonus')
+evaluator.apply_formula_to_column('=D:D*0.1', 'sheet1', 'bonus')
+# Applies 10% bonus to all values in column D
 ```
 
 ### `recalculate_all()`
