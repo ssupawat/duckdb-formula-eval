@@ -874,6 +874,23 @@ class FormulaEvaluator:
     # PUBLIC API: APPLY FORMULA TO COLUMN (SQL EXECUTION ONLY)
     # ========================================================================
 
+    def _ensure_column_exists(self, table_name: str, column_name: str) -> None:
+        """
+        Ensure a column exists in the table. Add it if it doesn't exist.
+
+        Args:
+            table_name: DuckDB table name
+            column_name: Column name to check/add
+        """
+        # Check if column exists
+        columns = self._get_cached_columns(table_name)
+        if column_name not in columns:
+            # Column doesn't exist, add it
+            # Default to DOUBLE type (can be overridden with ALTER TABLE ... TYPE later)
+            self.conn.execute(f'ALTER TABLE {table_name} ADD COLUMN "{column_name}" DOUBLE')
+            # Update cache
+            self._column_cache[table_name].append(column_name)
+
     def apply_formula_to_column(
         self,
         formula: str,
@@ -884,20 +901,25 @@ class FormulaEvaluator:
         Apply formula to column by executing SQL in DuckDB.
 
         This converts Excel formula to SQL and executes UPDATE directly.
-        No evaluation happens in Python - everything runs in DuckDB.
+        Non-destructive: adds target column if it doesn't exist.
 
         Args:
             formula: Excel formula (e.g., "=A2+B2", "=IF(A2>100, A2*1.1, A2)")
             sheet_name: Name of the sheet
-            target_column: Name of column to store results (must exist)
+            target_column: Name of column to store results (created if doesn't exist)
 
         Example:
             evaluator = FormulaEvaluator(conn)
-            evaluator.apply_formula_to_column('=A2+B2', 'sheet1', 'c')
-            # Executes: UPDATE sheet1 SET "c" = "a" + "b"
+            evaluator.apply_formula_to_column('=A2+B2', 'sheet1', 'result')
+            # Executes:
+            #   ALTER TABLE sheet1 ADD COLUMN result DOUBLE
+            #   UPDATE sheet1 SET result = "a" + "b"
             # Results stay in DuckDB - no return value
         """
         table_name = sheet_name.lower().replace(' ', '_')
+
+        # Ensure target column exists (add if not)
+        self._ensure_column_exists(table_name, target_column)
 
         # Build SQL expression from formula
         pattern = self._parse_formula_pattern(formula)
