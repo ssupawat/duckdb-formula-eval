@@ -12,6 +12,8 @@ Supported formula types:
 - Nested formulas: Aggregates inside IF statements, IF with aggregate conditions
 - Arithmetic on aggregates: SUM(D:D)*0.1
 - Cross-sheet VLOOKUP
+- LEN function: LEN(D:D) or LEN({ColumnName})
+- Column name references: {ColumnName} syntax
 """
 
 import re
@@ -64,12 +66,15 @@ class FormulaEvaluator:
         Convert Excel formula to pure DuckDB SQL.
 
         Conversion pipeline order (critical):
-        1. String literals (double quotes) → SQL (single quotes)
-        2. VLOOKUP → SQL subqueries
-        3. Aggregates → SQL subqueries
-        4. IF → CASE expressions
-        5. Cell references → scalar values
-        6. Operators → SQL operators
+        1. Cross-sheet cell references → SQL (before string literal conversion)
+        2. VLOOKUP → SQL subqueries (before string literal conversion!)
+        3. String literals (double quotes) → SQL (single quotes)
+        4. Aggregates → SQL subqueries
+        5. LEN function → SQL LENGTH (handles {ColumnName} internally)
+        6. {ColumnName} → SQL column references (for non-LEN contexts)
+        7. IF → CASE expressions
+        8. Cell references → scalar values
+        9. Operators → SQL operators
 
         Args:
             formula: Excel formula (with or without leading =)
@@ -81,6 +86,7 @@ class FormulaEvaluator:
         """
         # Remove leading = and whitespace
         expr = formula.lstrip('=').strip()
+        table_name = sheet_name.lower().replace(' ', '_')
 
         # Step 1: Cross-sheet cell references → SQL (before string literal conversion)
         # Use backticks for column names to avoid conflicts with Excel string literals
@@ -92,17 +98,23 @@ class FormulaEvaluator:
         # Step 3: Convert string literals (Excel "text" → SQL 'text')
         expr = self._convert_string_literals(expr)
 
-        # Step 3: Aggregates → SQL subqueries
+        # Step 4: Aggregates → SQL subqueries
         expr = self._convert_aggregates_to_sql(expr, sheet_name)
 
-        # Step 4: IF → CASE expressions
+        # Step 5: LEN function → SQL LENGTH (handles {ColumnName} internally)
+        expr = self._convert_len_to_sql(expr, table_name, row_ctx)
+
+        # Step 6: {ColumnName} → SQL column references (for non-LEN contexts)
+        expr = self._convert_braced_column_to_sql(expr, table_name)
+
+        # Step 7: IF → CASE expressions
         expr = self._convert_if_to_sql(expr)
 
-        # Step 5: Cell references → scalar values
+        # Step 8: Cell references → scalar values
         if row_ctx:
             expr = self._substitute_cell_references(expr, row_ctx)
 
-        # Step 6: Operators → SQL operators
+        # Step 9: Operators → SQL operators
         expr = self._convert_operators(expr)
 
         return f"SELECT {expr}"
@@ -475,6 +487,121 @@ class FormulaEvaluator:
         # This is handled in the context of SQL expressions
         return formula
 
+    def _convert_braced_column_to_sql(self, formula: str, table_name: str) -> str:
+        """
+        Convert {ColumnName} syntax to SQL column reference.
+
+        Pattern: {TaxID} → "taxid" (actual column name in DuckDB)
+        Uses case-insensitive header lookup to find the column.
+
+        Note: For LEN({ColumnName}), the LEN function handles braces internally.
+        This converts braces in other contexts (future use).
+        """
+        pattern = r'\{([A-Za-z_][A-Za-z0-9_]*)\}'
+
+        def replace_braced(m):
+            header_name = m.group(1)
+            col_name = self._get_column_by_header(header_name, table_name)
+            if col_name:
+                return f'"{col_name}"'
+            return m.group(0)
+
+        return re.sub(pattern, replace_braced, formula)
+
+    def _convert_len_to_sql(self, formula: str, table_name: str, row_ctx: Dict[str, float] = None) -> str:
+        """
+        Convert LEN function to SQL LENGTH function.
+
+        Patterns:
+        - LEN(D:D) → LENGTH("value") when row_ctx provided, LENGTH("column3") for aggregate
+        - LEN({TaxID}) → LENGTH("value") when row_ctx provided, LENGTH("taxid") for aggregate
+        - LEN(A2) → LENGTH("value") when row_ctx provided, LENGTH("column0") otherwise
+        """
+        # Helper to find cell value in row_ctx for a given column letter
+        def get_cell_value_for_column(col_letter: str) -> Any:
+            if not row_ctx:
+                return None
+            # Find the first cell in row_ctx that starts with the column letter
+            for cell_ref, value in row_ctx.items():
+                if cell_ref.startswith(col_letter) and cell_ref[len(col_letter):].isdigit():
+                    return value
+            return None
+
+        # Helper to find cell value in row_ctx for a given column name
+        def get_cell_value_for_column_by_name(col_name: str) -> Any:
+            if not row_ctx:
+                return None
+            # Get column letter from column name
+            col_letter = self._get_column_letter_for_name(col_name, table_name)
+            if col_letter:
+                return get_cell_value_for_column(col_letter)
+            return None
+
+        # Pattern: LEN(column_ref) where column_ref can be D:D, {Name}, or A2
+        def replace_len(m):
+            col_ref = m.group(1)
+
+            # Check if it's a braced column reference {TaxID}
+            # This must be checked BEFORE replacing braces in general formula
+            braced_match = re.match(r'^\{([A-Za-z_][A-Za-z0-9_]*)\}$', col_ref)
+            if braced_match:
+                header_name = braced_match.group(1)
+                col_name = self._get_column_by_header(header_name, table_name)
+                if col_name:
+                    # Check if we have a row_ctx value for this column
+                    cell_value = get_cell_value_for_column_by_name(col_name)
+                    if cell_value is not None:
+                        if isinstance(cell_value, str):
+                            return f"LENGTH('{cell_value}')"
+                        return f"LENGTH('{cell_value}')"
+                    return f'LENGTH("{col_name}")'
+                return f'LENGTH(NULL)'  # Column not found
+
+            # Check if it's a column range D:D
+            range_match = re.match(r'^([A-Z]):([A-Z])$', col_ref)
+            if range_match:
+                col_letter = range_match.group(1)
+                # Check if we have a row_ctx value for this column
+                cell_value = get_cell_value_for_column(col_letter)
+                if cell_value is not None:
+                    if isinstance(cell_value, str):
+                        return f"LENGTH('{cell_value}')"
+                    return f"LENGTH('{cell_value}')"
+                # Fall back to column reference
+                col_name = self._get_column_name(col_letter, table_name)
+                if col_name:
+                    return f'LENGTH("{col_name}")'
+                return 'LENGTH(NULL)'  # Column not found
+
+            # Check if it's a cell reference A2
+            cell_match = re.match(r'^([A-Z])\d+$', col_ref)
+            if cell_match:
+                cell_ref = col_ref
+                # Check if we have this cell in row_ctx
+                if row_ctx and cell_ref in row_ctx:
+                    value = row_ctx[cell_ref]
+                    if isinstance(value, str):
+                        return f"LENGTH('{value}')"
+                    return f"LENGTH('{value}')"
+                # Fall back to column reference
+                col_letter = cell_match.group(1)
+                col_name = self._get_column_name(col_letter, table_name)
+                if col_name:
+                    return f'LENGTH("{col_name}")'
+                return 'LENGTH(NULL)'  # Column not found
+
+            # Unknown format, return as-is
+            return f'LENGTH({col_ref})'
+
+        return re.sub(r'LEN\(([^)]+)\)', replace_len, formula)
+
+    def _get_column_letter_for_name(self, col_name: str, table_name: str) -> Optional[str]:
+        """Get the column letter (A, B, C, etc.) for a given column name."""
+        cols = self._get_cached_columns(table_name)
+        if col_name in cols:
+            return chr(ord('A') + cols.index(col_name))
+        return None
+
     # Aggregate conversion methods
     def _sum_to_sql(self, m: re.Match, table_name: str) -> str:
         col = self._get_column_name(m.group(1), table_name)
@@ -612,7 +739,52 @@ class FormulaEvaluator:
                 'else_col': match.group(5)        # False result column
             }
 
+        # Pattern: LEN({ColumnName})=13 or LEN(D:D)=13
+        # Support both {ColumnName} and D:D syntax
+        # Extract from original formula (before upper) to preserve case for {ColumnName}
+        original_formula = formula.lstrip('=').strip()
+        match = re.match('^LEN\\(\\{([A-Za-z_][A-Za-z0-9_]*)\\}\\)\\s*([><=!]+)\\s*(\\d+(?:\\.\\d+)?)$', original_formula, re.IGNORECASE)
+        if match:
+            return {
+                'type': 'len_comparison_braced',
+                'header': match.group(1),         # Column header name (preserved case)
+                'op': match.group(2),             # Comparison operator
+                'value': match.group(3)           # Comparison value
+            }
+
+        match = re.match(r'^LEN\(([A-Z]):([A-Z])\)\s*([><=!]+)\s*(\d+(?:\.\d+)?)$', formula_clean)
+        if match:
+            return {
+                'type': 'len_comparison_range',
+                'col': match.group(1),            # Column letter
+                'op': match.group(3),             # Comparison operator
+                'value': match.group(4)           # Comparison value
+            }
+
         return {'type': 'complex'}
+
+    def _get_cached_columns(self, table_name: str) -> List[str]:
+        """
+        Get cached column names for a table, populating cache if necessary.
+
+        Args:
+            table_name: DuckDB table name
+
+        Returns:
+            List of column names in order
+        """
+        if table_name not in self._column_cache:
+            try:
+                result = self.conn.execute(f"""
+                    SELECT column_name
+                    FROM information_schema.columns
+                    WHERE table_name = '{table_name.lower()}'
+                    ORDER BY ordinal_position
+                """).fetchall()
+                self._column_cache[table_name] = [row[0] for row in result]
+            except Exception:
+                self._column_cache[table_name] = []
+        return self._column_cache[table_name]
 
     def _get_column_name(self, col_letter: str, table_name: str) -> Optional[str]:
         """
@@ -645,6 +817,55 @@ class FormulaEvaluator:
 
         if 0 <= col_idx < len(columns):
             return columns[col_idx]
+        return None
+
+    def _get_column_by_header(self, header_name: str, table_name: str) -> Optional[str]:
+        """
+        Find column by header name (case-insensitive reverse lookup).
+
+        Tries multiple matching strategies:
+        1. Exact match (case-insensitive)
+        2. Underscore conversion: "ShortID" → "short_id"
+
+        Args:
+            header_name: Column header name to search for (e.g., 'TaxID', 'taxid')
+            table_name: DuckDB table name
+
+        Returns:
+            Actual DuckDB column name or None if not found
+        """
+        # Ensure cache is populated
+        if table_name not in self._column_cache:
+            try:
+                result = self.conn.execute(f"""
+                    SELECT column_name
+                    FROM information_schema.columns
+                    WHERE table_name = '{table_name.lower()}'
+                    ORDER BY ordinal_position
+                """).fetchall()
+                self._column_cache[table_name] = [row[0] for row in result]
+            except Exception:
+                self._column_cache[table_name] = []
+
+        header_lower = header_name.lower()
+
+        # Strategy 1: Direct case-insensitive match
+        for col_name in self._column_cache[table_name]:
+            if col_name.lower() == header_lower:
+                return col_name
+
+        # Strategy 2: Try underscore conversion (PascalCase → snake_case)
+        # "ShortID" → "short_id"
+        import re
+        # Insert underscore before uppercase letters that are followed by lowercase letters
+        # or before uppercase letters that follow lowercase letters
+        snake_case = re.sub(r'([a-z])([A-Z])', r'\1_\2', header_name).lower()
+        # Also handle consecutive uppercase: "TaxID" → "tax_id"
+        snake_case = re.sub(r'([A-Z]+)([A-Z][a-z])', r'\1_\2', snake_case).lower()
+        for col_name in self._column_cache[table_name]:
+            if col_name.lower() == snake_case:
+                return col_name
+
         return None
 
     # ========================================================================
@@ -779,6 +1000,21 @@ class FormulaEvaluator:
                 col_else = self._get_column_name(pattern['else_col'], table_name)
                 if col1 and col2 and col_result and col_else:
                     return f'CASE WHEN "{col1}" {pattern["op"]} "{col2}" THEN "{col_result}" ELSE "{col_else}" END'
+
+        elif pattern['type'] == 'len_comparison_braced':
+            # LEN({TaxID})=13
+            header = pattern['header']
+            col = self._get_column_by_header(header, table_name)
+            if col:
+                return f'LENGTH("{col}") {pattern["op"]} {pattern["value"]}'
+            return 'NULL'
+
+        elif pattern['type'] == 'len_comparison_range':
+            # LEN(D:D)=13
+            col = self._get_column_name(pattern['col'], table_name)
+            if col:
+                return f'LENGTH("{col}") {pattern["op"]} {pattern["value"]}'
+            return 'NULL'
 
         # For complex formulas, use full SQL conversion
         return self.excel_to_sql(formula, table_name.replace('_', ' ').title()).replace('SELECT ', '')

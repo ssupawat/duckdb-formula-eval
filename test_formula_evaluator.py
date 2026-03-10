@@ -517,6 +517,62 @@ TEST_CASES = [
         # Note: This returns the first row's value (LIMIT 1), not row-by-row correspondence
         # For apply_formula_to_column, row-by-row logic is implemented separately
     },
+
+    # =========================================================================
+    # TECHNIQUE 6: LEN FUNCTION
+    # =========================================================================
+
+    # ── Partition: LEN with Column Letter References ────────────────────────────
+    {
+        "technique": "Equivalence Partitioning",
+        "partition": "LEN with B:B (column range)",
+        "name": "LEN(B:B)=6 - TRUE (6 chars with space)",
+        "formula": "=LEN(B:B)=6",
+        "row_ctx": {"B2": "Item 1"},
+        "expected": True,  # "Item 1", "Item 2", etc. are 6 chars (with space)
+    },
+    {
+        "technique": "Equivalence Partitioning",
+        "partition": "LEN with {ColumnName} (braced syntax)",
+        "name": "LEN({Name})=6 - TRUE (6 chars)",
+        "formula": "=LEN({Name})=6",
+        "row_ctx": {"B2": "Item 1"},
+        "expected": True,  # "Item 1" is 6 characters (with space)
+    },
+
+    # ── Partition: LEN with Different Comparison Operators ────────────────────────
+    {
+        "technique": "Boundary Value Analysis",
+        "partition": "LEN with > comparison",
+        "name": "LEN(B:B)>10 - greater than",
+        "formula": "=LEN(B:B)>10",
+        "row_ctx": {"B2": "Item 1"},
+        "expected": False,  # Names are 6 chars, not > 10
+    },
+    {
+        "technique": "Boundary Value Analysis",
+        "partition": "LEN with < comparison",
+        "name": "LEN(B:B)<10 - less than",
+        "formula": "=LEN(B:B)<10",
+        "row_ctx": {"B2": "Item 1"},
+        "expected": True,  # Names are 6 chars, < 10
+    },
+    {
+        "technique": "Boundary Value Analysis",
+        "partition": "LEN with >= comparison",
+        "name": "LEN(B:B)>=6 - greater or equal (boundary)",
+        "formula": "=LEN(B:B)>=6",
+        "row_ctx": {"B2": "Item 1"},
+        "expected": True,  # Names are 6 chars, = 6 (boundary case)
+    },
+    {
+        "technique": "Boundary Value Analysis",
+        "partition": "LEN with <= comparison",
+        "name": "LEN(B:B)<=6 - less or equal (boundary)",
+        "formula": "=LEN(B:B)<=6",
+        "row_ctx": {"B2": "Item 1"},
+        "expected": True,  # Names are 6 chars, = 6 (boundary case)
+    },
 ]
 
 
