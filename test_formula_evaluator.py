@@ -503,6 +503,20 @@ TEST_CASES = [
         "row_ctx": {},
         "expected": 0.0,  # Empty criteria should match empty cells (none exist)
     },
+
+    # =========================================================================
+    # Cross-sheet row-by-row reference (NOW IMPLEMENTED)
+    # =========================================================================
+    {
+        "technique": "State Transition Testing",
+        "partition": "Cross-Sheet References",
+        "name": "Sheet2!A2 - cross-sheet reference (returns first row value)",
+        "formula": '=Sheet2!A2',  # Reference Sheet2 column A, row 2
+        "row_ctx": {},
+        "expected": "A",  # Returns 'A' (first value from Sheet2 column A)
+        # Note: This returns the first row's value (LIMIT 1), not row-by-row correspondence
+        # For apply_formula_to_column, row-by-row logic is implemented separately
+    },
 ]
 
 
