@@ -16,7 +16,7 @@ Supported formula types:
 
 import re
 import duckdb
-import pandas as pd
+import sys
 from typing import Any, Dict, List, Tuple, Optional, Union
 
 
@@ -251,6 +251,20 @@ class FormulaEvaluator:
             formula
         )
 
+        # Handle COUNTIF(C:C,"") pattern - empty criteria (BEFORE simple equality!)
+        formula = re.sub(
+            r'COUNTIF\(([A-Z]):([A-Z]),\s*""\)',
+            lambda m: self._countif_empty_to_sql(m, table_name),
+            formula
+        )
+
+        # Handle COUNTIF(C:C,'') pattern - empty criteria with single quotes
+        formula = re.sub(
+            r"COUNTIF\(([A-Z]):([A-Z]),\s*''\)",
+            lambda m: self._countif_empty_to_sql(m, table_name),
+            formula
+        )
+
         # Handle COUNTIF(C:C,"x") pattern - simple equality
         formula = re.sub(
             r'COUNTIF\(([A-Z]):([A-Z]),\s*"([^"]*)"\)',
@@ -282,14 +296,14 @@ class FormulaEvaluator:
         # Handle SUMIF(C:C,"",D:D) pattern - empty criteria (BEFORE simple equality!)
         formula = re.sub(
             r'SUMIF\(([A-Z]):([A-Z]),\s*"",\s*([A-Z]):([A-Z])\)',
-            lambda m: '0',  # Empty criteria matches no cells
+            lambda m: self._sumif_empty_to_sql(m, table_name),
             formula
         )
 
         # Handle SUMIF(C:C,'',D:D) pattern - empty criteria with single quotes
         formula = re.sub(
             r"SUMIF\(([A-Z]):([A-Z]),\s*'',\s*([A-Z]):([A-Z])\)",
-            lambda m: '0',  # Empty criteria matches no cells
+            lambda m: self._sumif_empty_to_sql(m, table_name),
             formula
         )
 
@@ -426,8 +440,8 @@ class FormulaEvaluator:
             # Create index if it doesn't exist
             try:
                 self.conn.execute(f'CREATE INDEX {index_name} ON {table_name}("{column_name}")')
-            except Exception:
-                pass  # Index creation might fail for various reasons
+            except Exception as e:
+                print(f"Warning: Failed to create index '{index_name}' on '{table_name}': {e}", file=sys.stderr)
 
     def _substitute_cell_references(self, formula: str, row_ctx: Dict[str, float]) -> str:
         """Substitute cell references with scalar values from row context."""
@@ -524,6 +538,21 @@ class FormulaEvaluator:
         if not filter_col or not sum_col:
             return '0'
         return f"(SELECT COALESCE(SUM(\"{sum_col}\"), 0) FROM {table_name} WHERE \"{filter_col}\" {criteria})"
+
+    def _countif_empty_to_sql(self, m: re.Match, table_name: str) -> str:
+        """Handle COUNTIF with empty string criteria - matches NULL (blank cells)."""
+        filter_col = self._get_column_name(m.group(1), table_name)
+        if not filter_col:
+            return '0'
+        return f"(SELECT COUNT(*) FROM {table_name} WHERE \"{filter_col}\" IS NULL)"
+
+    def _sumif_empty_to_sql(self, m: re.Match, table_name: str) -> str:
+        """Handle SUMIF with empty string criteria - matches NULL (blank cells)."""
+        filter_col = self._get_column_name(m.group(1), table_name)
+        sum_col = self._get_column_name(m.group(3), table_name)
+        if not filter_col or not sum_col:
+            return '0'
+        return f"(SELECT COALESCE(SUM(\"{sum_col}\"), 0) FROM {table_name} WHERE \"{filter_col}\" IS NULL)"
 
     # ========================================================================
     # PATTERN DETECTION & VECTORIZED EVALUATION
